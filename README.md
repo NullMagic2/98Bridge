@@ -5,9 +5,6 @@ Browse in Explorer, inspect sectors in a hex viewer, or export raw data.
 
 **Zero external dependencies** — just Python 3.8+ with tkinter.
 
-<img width="1810" height="1300" alt="image" src="https://github.com/user-attachments/assets/5e22d1f2-6ed8-43e4-82ea-138a5baec7b3" />
-
-
 ## How It Works
 
 Mounting uses Windows' built-in `subst` command: image contents are extracted

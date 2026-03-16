@@ -1,16 +1,21 @@
 """
-Mount backends for PC-98 disk images on Windows.
+Mount backends for PC-98 disk images.
 
-Two strategies, tried in order:
-  1. VHD (preferred) — creates a small virtual hard disk of the correct
-     size, formats it, copies files, and mounts it as a drive letter.
-     Shows correct disk size in Explorer. Requires admin privileges
-     (a UAC prompt will appear).
+Supports Windows and Linux (including WSL).
+
+Windows strategies (tried in order):
+  1. VHD (preferred) — creates a virtual hard disk of the correct size,
+     formats it, copies files, and mounts as a drive letter.
+     Shows correct disk size in Explorer. Requires admin privileges.
   2. subst (fallback) — extracts to a temp directory and uses `subst`
      to assign a drive letter. No admin needed, but Explorer shows the
      host drive's size instead of the image's.
 
-Both are read-only from the image's perspective.
+Linux / WSL strategy:
+  3. Directory mount — extracts to a directory under a configurable base
+     path (default: ~/.local/share/pc98mount/mounts).
+
+All strategies are read-only from the image's perspective.
 """
 
 import os
@@ -26,11 +31,40 @@ log = logging.getLogger("pc98mount.mount")
 
 
 # =============================================================================
+# Platform detection
+# =============================================================================
+
+def is_windows():
+    return sys.platform == 'win32'
+
+
+def is_wsl():
+    """Detect Windows Subsystem for Linux."""
+    if is_windows():
+        return False
+    try:
+        with open('/proc/version', 'r') as f:
+            return 'microsoft' in f.read().lower()
+    except (OSError, IOError):
+        return False
+
+
+_IS_WSL = None
+
+
+def _cached_is_wsl():
+    global _IS_WSL
+    if _IS_WSL is None:
+        _IS_WSL = is_wsl()
+    return _IS_WSL
+
+
+# =============================================================================
 # Helpers
 # =============================================================================
 
 def _sanitize_filename(name):
-    """Remove or replace characters invalid in Windows filenames."""
+    """Remove or replace characters invalid in filenames."""
     invalid = '<>:"/\\|?*'
     result = ''.join(c if c not in invalid else '_' for c in name)
     result = result.rstrip('. ')
@@ -83,22 +117,22 @@ def _write_sectors_to_dir(disk_image, dest_path):
 
 
 def _is_admin():
-    """Check if we're running with admin privileges."""
-    if sys.platform != 'win32':
-        return False
-    try:
-        import ctypes
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        return False
+    """Check if we're running with admin/root privileges."""
+    if is_windows():
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return False
+    else:
+        return os.geteuid() == 0
 
 
 def _run_diskpart(script_text):
     """
-    Run a diskpart script. Returns (success, output).
+    Run a diskpart script (Windows only). Returns (success, output).
     Requires admin privileges.
     """
-    # Write script to temp file
     script_path = os.path.join(tempfile.gettempdir(), 'pc98_diskpart.txt')
     with open(script_path, 'w') as f:
         f.write(script_text)
@@ -126,21 +160,18 @@ def _run_diskpart(script_text):
 
 def _run_elevated(command, args):
     """
-    Run a command with UAC elevation. Returns (success, output).
+    Run a command with UAC elevation (Windows only). Returns (success, output).
     Uses ShellExecuteExW to trigger the UAC prompt.
     """
-    if sys.platform != 'win32':
+    if not is_windows():
         return False, "Not on Windows"
 
     import ctypes
-    from ctypes import wintypes
 
-    # Write a batch file that runs the command and captures output
     batch_path = os.path.join(tempfile.gettempdir(), 'pc98_elevated.bat')
     output_path = os.path.join(tempfile.gettempdir(), 'pc98_elevated_out.txt')
     done_path = os.path.join(tempfile.gettempdir(), 'pc98_elevated_done.txt')
 
-    # Clean up any old marker
     for p in (output_path, done_path):
         try:
             os.unlink(p)
@@ -153,7 +184,6 @@ def _run_elevated(command, args):
         f.write(f'echo DONE > "{done_path}"\n')
 
     try:
-        # ShellExecuteW with "runas" verb triggers UAC
         ret = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", "cmd.exe",
             f'/c "{batch_path}"',
@@ -163,15 +193,13 @@ def _run_elevated(command, args):
         if ret <= 32:
             return False, f"ShellExecute failed (code {ret})"
 
-        # Wait for completion (poll for done marker)
-        for _ in range(60):  # max 30 seconds
+        for _ in range(60):
             time.sleep(0.5)
             if os.path.exists(done_path):
                 break
         else:
             return False, "Elevated process timed out"
 
-        # Read output
         output = ""
         if os.path.exists(output_path):
             with open(output_path, 'r', errors='replace') as f:
@@ -187,14 +215,45 @@ def _run_elevated(command, args):
                 pass
 
 
+def open_in_file_manager(path):
+    """Open a path in the platform's file manager."""
+    if is_windows():
+        os.startfile(path)
+    elif _cached_is_wsl():
+        # WSL: use Windows Explorer via interop
+        try:
+            result = subprocess.run(
+                ['wslpath', '-w', path],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                win_path = result.stdout.strip()
+                subprocess.Popen(['explorer.exe', win_path])
+            else:
+                subprocess.Popen(['explorer.exe', path])
+        except FileNotFoundError:
+            # wslpath or explorer.exe not available, fall back
+            subprocess.Popen(['xdg-open', path])
+    else:
+        # Native Linux / macOS
+        try:
+            subprocess.Popen(['xdg-open', path])
+        except FileNotFoundError:
+            try:
+                subprocess.Popen(['open', path])   # macOS
+            except FileNotFoundError:
+                log.error("No file manager command found (tried xdg-open, open)")
+
+
 # =============================================================================
-# Strategy 1: VHD Mount (correct disk size, needs admin)
+# Strategy 1: VHD Mount (Windows only, correct disk size, needs admin)
 # =============================================================================
 
 class VHDMount:
     """
     Creates a VHD (Virtual Hard Disk), formats it to the correct size,
     copies files, and assigns a drive letter. Explorer shows the real size.
+    Windows only.
     """
 
     def __init__(self, drive_letter):
@@ -219,15 +278,12 @@ class VHDMount:
         staging = os.path.join(self._temp_dir, "staging")
         os.makedirs(staging)
 
-        # Extract files to staging dir
         counters = {'files': 0, 'errors': 0}
         _extract_fat_to_dir(fat_fs, fat_fs.root, staging, counters)
         self._extract_count = counters['files']
         self._extract_errors = counters['errors']
 
         log.info(f"Extracted {counters['files']} files, {counters['errors']} errors")
-
-        # Create and mount VHD
         self._create_and_mount_vhd(image_size_bytes, staging)
 
     def mount_flat(self, disk_image):
@@ -252,13 +308,11 @@ class VHDMount:
 
     def _create_and_mount_vhd(self, image_size_bytes, staging_dir):
         """Create a VHD, format it, copy files from staging, assign drive letter."""
-        # VHD size: image size + overhead for filesystem, minimum 3MB
         vhd_size_mb = max(3, (image_size_bytes // (1024 * 1024)) + 2)
         self._vhd_path = os.path.join(self._temp_dir, "pc98disk.vhd")
 
         log.info(f"Creating {vhd_size_mb}MB VHD at {self._vhd_path}")
 
-        # Step 1: Create, attach, partition, format, assign letter
         create_script = (
             f'create vdisk file="{self._vhd_path}" maximum={vhd_size_mb} type=fixed\n'
             f'select vdisk file="{self._vhd_path}"\n'
@@ -271,7 +325,6 @@ class VHDMount:
         if _is_admin():
             ok, output = _run_diskpart(create_script)
         else:
-            # Need elevation
             script_path = os.path.join(self._temp_dir, 'create.txt')
             with open(script_path, 'w') as f:
                 f.write(create_script)
@@ -280,20 +333,19 @@ class VHDMount:
         if not ok:
             raise RuntimeError(f"Failed to create VHD:\n{output}")
 
-        # Wait for drive letter to appear
         drive_path = f"{self.drive_letter}:\\"
         for _ in range(20):
             if os.path.exists(drive_path):
                 break
             time.sleep(0.3)
         else:
-            raise RuntimeError(f"Drive {self.drive_letter}: did not appear after VHD mount")
+            raise RuntimeError(
+                f"Drive {self.drive_letter}: did not appear after VHD mount"
+            )
 
-        # Step 2: Copy files from staging to the VHD
         log.info(f"Copying files to {drive_path}")
         self._copy_tree(staging_dir, drive_path)
 
-        # Make files read-only
         try:
             for root, dirs, files in os.walk(drive_path):
                 for fname in files:
@@ -338,14 +390,11 @@ class VHDMount:
                 with open(script_path, 'w') as f:
                     f.write(detach_script)
                 _run_elevated('diskpart', f'/s "{script_path}"')
-                # Wait for detach
                 time.sleep(1)
 
         self._mounted = False
 
-        # Clean up temp directory (including VHD file)
         if self._temp_dir and os.path.exists(self._temp_dir):
-            # Give Windows a moment to release handles
             time.sleep(0.5)
             try:
                 shutil.rmtree(self._temp_dir, ignore_errors=True)
@@ -358,7 +407,7 @@ class VHDMount:
 
 
 # =============================================================================
-# Strategy 2: Extract + subst (zero dependencies, no admin)
+# Strategy 2: Extract + subst (Windows, zero dependencies, no admin)
 # =============================================================================
 
 class SubstMount:
@@ -366,6 +415,7 @@ class SubstMount:
     Extracts image contents to a temp directory and uses
     Windows `subst` to map a drive letter to that directory.
     No admin required, but Explorer shows host drive's space.
+    Windows only.
     """
 
     def __init__(self, drive_letter):
@@ -448,25 +498,121 @@ class SubstMount:
 
 
 # =============================================================================
+# Strategy 3: Directory mount (Linux / WSL / any platform)
+# =============================================================================
+
+class DirectoryMount:
+    """
+    Extracts image contents into a directory and exposes that path as the
+    mount point.  Works on any platform — no admin, no special OS features.
+
+    The mount point is a real directory, not a drive letter.
+    """
+
+    DEFAULT_BASE = os.path.expanduser("~/.local/share/pc98mount/mounts")
+
+    def __init__(self, mount_path):
+        """
+        mount_path: the directory that will contain the extracted files.
+        Created on mount, removed on unmount.
+        """
+        self._mount_path = os.path.abspath(mount_path)
+        self._mounted = False
+        self._extract_count = 0
+        self._extract_errors = 0
+
+    @property
+    def mount_point(self):
+        return self._mount_path
+
+    @property
+    def is_mounted(self):
+        return self._mounted
+
+    def mount_fat(self, fat_fs):
+        self._ensure_dir()
+        counters = {'files': 0, 'errors': 0}
+        _extract_fat_to_dir(fat_fs, fat_fs.root, self._mount_path, counters)
+        self._extract_count = counters['files']
+        self._extract_errors = counters['errors']
+        log.info(
+            f"Extracted {counters['files']} files, "
+            f"{counters['errors']} errors to {self._mount_path}"
+        )
+        if counters['files'] == 0:
+            log.warning("No files extracted!")
+        self._mounted = True
+
+    def mount_flat(self, disk_image):
+        self._ensure_dir()
+        _write_flat_to_dir(disk_image, self._mount_path)
+        self._mounted = True
+
+    def mount_sectors(self, disk_image):
+        self._ensure_dir()
+        _write_sectors_to_dir(disk_image, self._mount_path)
+        self._mounted = True
+
+    def unmount(self):
+        if not self._mounted:
+            return
+        self._mounted = False
+        if os.path.exists(self._mount_path):
+            try:
+                shutil.rmtree(self._mount_path, ignore_errors=True)
+                log.info(f"Cleaned up {self._mount_path}")
+            except Exception as e:
+                log.warning(f"Cleanup failed: {e}")
+
+    def _ensure_dir(self):
+        """Create the mount directory, cleaning it first if it already exists."""
+        if os.path.exists(self._mount_path):
+            shutil.rmtree(self._mount_path, ignore_errors=True)
+        os.makedirs(self._mount_path, exist_ok=True)
+
+    @classmethod
+    def default_base(cls):
+        """Return the default base directory for new mounts."""
+        return cls.DEFAULT_BASE
+
+
+# =============================================================================
 # Unified mount interface
 # =============================================================================
 
 class MountManager:
     """
     High-level mount interface.
-    Tries VHD first (correct size), falls back to subst (wrong size).
+
+    On Windows: tries VHD first, falls back to subst.
+    On Linux/WSL: uses DirectoryMount (extract to a named directory).
+
+    Mount identifiers:
+      - Windows: drive letter string like "P"
+      - Linux:   a short name (becomes a subdirectory under mount_base)
+                 or a full absolute path
     """
 
     STRATEGY_VHD = "vhd"
     STRATEGY_SUBST = "subst"
+    STRATEGY_DIRECTORY = "directory"
 
-    def __init__(self):
-        self._mounts = {}  # drive_letter -> mount object
+    def __init__(self, mount_base=None):
+        self._mounts = {}   # key -> mount object
         self._strategy = None
+        self._mount_base = mount_base or DirectoryMount.default_base()
 
     @property
     def strategy(self):
         return self._strategy
+
+    @property
+    def mount_base(self):
+        return self._mount_base
+
+    @mount_base.setter
+    def mount_base(self, value):
+        self._mount_base = value
 
     def get_strategy_info(self):
         if self._strategy == self.STRATEGY_VHD:
@@ -481,34 +627,114 @@ class MountManager:
                 "Explorer shows host drive's size (cosmetic only).\n"
                 "Run as Administrator for correct size display via VHD."
             )
+        elif self._strategy == self.STRATEGY_DIRECTORY:
+            wsl_tag = " (WSL detected)" if _cached_is_wsl() else ""
+            return (
+                f"Using directory extraction{wsl_tag}.\n"
+                f"Mount base: {self._mount_base}\n"
+                "Original image is not modified."
+            )
         return "No mount active."
 
-    def mount(self, drive_letter, mode, disk_image=None, fat_fs=None,
+    # -- key normalisation ----------------------------------------------------
+
+    def _mount_key(self, identifier):
+        """Normalise a mount identifier to a dict key."""
+        if is_windows():
+            return identifier.upper().rstrip(':')
+        else:
+            if not os.path.isabs(identifier):
+                return os.path.abspath(
+                    os.path.join(self._mount_base, identifier)
+                )
+            return os.path.abspath(identifier)
+
+    # -- public API -----------------------------------------------------------
+
+    def mount(self, mount_id, mode, disk_image=None, fat_fs=None,
               image_size_bytes=0, prefer_vhd=True):
         """
-        Mount an image at the given drive letter.
+        Mount an image.
 
-        Tries VHD first, falls back to subst if that fails.
+        mount_id:
+          - Windows: drive letter (e.g. "P")
+          - Linux/WSL: a short name that becomes a subdirectory under
+            mount_base, or a full absolute path.
         """
-        drive = drive_letter.upper().rstrip(':')
-        if drive in self._mounts:
-            raise RuntimeError(f"{drive}: is already mounted")
+        key = self._mount_key(mount_id)
+        if key in self._mounts:
+            raise RuntimeError(f"{mount_id} is already mounted")
 
         if image_size_bytes == 0 and disk_image:
             image_size_bytes = disk_image.total_sectors * disk_image.sector_size
 
-        # Try VHD first (only on Windows)
-        if prefer_vhd and sys.platform == 'win32':
+        if is_windows():
+            return self._mount_windows(
+                key, mode, disk_image, fat_fs, image_size_bytes, prefer_vhd
+            )
+        else:
+            return self._mount_linux(key, mount_id, mode, disk_image, fat_fs)
+
+    def unmount(self, mount_id):
+        key = self._mount_key(mount_id)
+        mount = self._mounts.pop(key, None)
+        if mount:
+            mount.unmount()
+        return mount is not None
+
+    def unmount_all(self):
+        for key in list(self._mounts.keys()):
+            mount = self._mounts.pop(key, None)
+            if mount:
+                mount.unmount()
+
+    def is_mounted(self, mount_id):
+        key = self._mount_key(mount_id)
+        mount = self._mounts.get(key)
+        return mount is not None and mount.is_mounted
+
+    def get_mount(self, mount_id):
+        key = self._mount_key(mount_id)
+        return self._mounts.get(key)
+
+    # -- internal -------------------------------------------------------------
+
+    def _mount_windows(self, drive, mode, disk_image, fat_fs,
+                       image_size_bytes, prefer_vhd):
+        """Windows: VHD first, then subst fallback."""
+        if prefer_vhd:
             try:
-                mount = self._try_vhd_mount(drive, mode, disk_image, fat_fs, image_size_bytes)
+                mount = self._try_vhd_mount(
+                    drive, mode, disk_image, fat_fs, image_size_bytes
+                )
                 self._mounts[drive] = mount
                 self._strategy = self.STRATEGY_VHD
                 return mount
             except Exception as e:
                 log.warning(f"VHD mount failed, falling back to subst: {e}")
 
-        # Fallback: subst
         mount = SubstMount(drive)
+        self._do_mount(mount, mode, disk_image, fat_fs)
+        self._mounts[drive] = mount
+        self._strategy = self.STRATEGY_SUBST
+        return mount
+
+    def _mount_linux(self, key, mount_id, mode, disk_image, fat_fs):
+        """Linux/WSL: extract into a directory."""
+        if not os.path.isabs(mount_id):
+            mount_path = os.path.join(self._mount_base, mount_id)
+        else:
+            mount_path = mount_id
+
+        mount = DirectoryMount(mount_path)
+        self._do_mount(mount, mode, disk_image, fat_fs)
+        self._mounts[key] = mount
+        self._strategy = self.STRATEGY_DIRECTORY
+        return mount
+
+    @staticmethod
+    def _do_mount(mount, mode, disk_image, fat_fs):
+        """Run the appropriate extraction for *mount*."""
         if mode == 'fat':
             if fat_fs is None:
                 raise ValueError("FAT filesystem required for fat mode")
@@ -524,12 +750,9 @@ class MountManager:
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
-        self._mounts[drive] = mount
-        self._strategy = self.STRATEGY_SUBST
-        return mount
-
-    def _try_vhd_mount(self, drive, mode, disk_image, fat_fs, image_size_bytes):
-        """Attempt to mount via VHD."""
+    def _try_vhd_mount(self, drive, mode, disk_image, fat_fs,
+                       image_size_bytes):
+        """Attempt to mount via VHD (Windows only)."""
         mount = VHDMount(drive)
         if mode == 'fat':
             if fat_fs is None:
@@ -544,23 +767,3 @@ class MountManager:
                 raise ValueError("Disk image required")
             mount.mount_sectors(disk_image)
         return mount
-
-    def unmount(self, drive_letter):
-        drive = drive_letter.upper().rstrip(':')
-        mount = self._mounts.pop(drive, None)
-        if mount:
-            mount.unmount()
-        return mount is not None
-
-    def unmount_all(self):
-        for drive in list(self._mounts.keys()):
-            self.unmount(drive)
-
-    def is_mounted(self, drive_letter):
-        drive = drive_letter.upper().rstrip(':')
-        mount = self._mounts.get(drive)
-        return mount is not None and mount.is_mounted
-
-    def get_mount(self, drive_letter):
-        drive = drive_letter.upper().rstrip(':')
-        return self._mounts.get(drive)

@@ -1,13 +1,11 @@
 """
-Sector-level hex viewer widget for PC-98 disk images.
+Sector-level hex viewer widget for PC-98 disk images (wxPython).
 Provides a traditional hex editor view with sector navigation,
 bookmarking, search, and raw export.
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+import wx
 import struct
-import re
 
 
 # Known PC-98 I/O and structure signatures for auto-annotation
@@ -42,20 +40,23 @@ BPB_FIELDS = {
 }
 
 
-class HexViewerWidget(ttk.Frame):
+class HexViewerPanel(wx.Panel):
     """
     A sector-level hex viewer with navigation and analysis features.
-    Embeds into a parent tkinter container.
+    Embeds into a parent wx container.
     """
 
     BYTES_PER_ROW = 16
 
-    def __init__(self, parent, **kwargs):
-        super().__init__(parent, **kwargs)
+    def __init__(self, parent):
+        super().__init__(parent)
         self.disk = None
         self.current_sector = 0
-        self.bookmarks = {}  # sector -> label
-        self.sector_annotations = {}  # sector -> list of (offset, length, label)
+        self.bookmarks = {}
+        self.sector_annotations = {}
+        self._search_bytes = None
+        self._search_pos = 0
+        self._offset_absolute = False
         self._build_ui()
 
     def set_disk(self, disk_image):
@@ -67,125 +68,150 @@ class HexViewerWidget(ttk.Frame):
         self._update_nav_limits()
         self._show_sector(0)
 
-    # -- UI Construction --
+    # ── UI Construction ──────────────────────────────────────────────
 
     def _build_ui(self):
-        # Navigation bar
-        nav = ttk.Frame(self)
-        nav.pack(fill=tk.X, pady=(0, 4))
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        ttk.Button(nav, text="◀◀", width=3, command=self._go_first).pack(side=tk.LEFT)
-        ttk.Button(nav, text="◀", width=3, command=self._go_prev).pack(side=tk.LEFT)
+        # --- Navigation bar ---
+        nav_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        btn_first = wx.Button(self, label="\u25C0\u25C0", size=(36, -1))
+        btn_prev = wx.Button(self, label="\u25C0", size=(36, -1))
+        btn_first.Bind(wx.EVT_BUTTON, lambda e: self._go_first())
+        btn_prev.Bind(wx.EVT_BUTTON, lambda e: self._go_prev())
+        nav_sizer.Add(btn_first, 0, wx.RIGHT, 1)
+        nav_sizer.Add(btn_prev, 0, wx.RIGHT, 4)
 
-        ttk.Label(nav, text="Sector:").pack(side=tk.LEFT, padx=(8, 2))
-        self.sector_var = tk.StringVar(value="0")
-        self.sector_entry = ttk.Entry(nav, textvariable=self.sector_var, width=8)
-        self.sector_entry.pack(side=tk.LEFT)
-        self.sector_entry.bind('<Return>', lambda e: self._go_to_sector())
-        ttk.Button(nav, text="Go", command=self._go_to_sector).pack(side=tk.LEFT, padx=2)
+        nav_sizer.Add(wx.StaticText(self, label="Sector:"),
+                       0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.sector_ctrl = wx.TextCtrl(self, value="0", size=(80, -1),
+                                        style=wx.TE_PROCESS_ENTER)
+        self.sector_ctrl.Bind(wx.EVT_TEXT_ENTER, lambda e: self._go_to_sector())
+        nav_sizer.Add(self.sector_ctrl, 0, wx.RIGHT, 2)
+        btn_go = wx.Button(self, label="Go", size=(40, -1))
+        btn_go.Bind(wx.EVT_BUTTON, lambda e: self._go_to_sector())
+        nav_sizer.Add(btn_go, 0, wx.RIGHT, 4)
 
-        ttk.Button(nav, text="▶", width=3, command=self._go_next).pack(side=tk.LEFT)
-        ttk.Button(nav, text="▶▶", width=3, command=self._go_last).pack(side=tk.LEFT)
+        btn_next = wx.Button(self, label="\u25B6", size=(36, -1))
+        btn_last = wx.Button(self, label="\u25B6\u25B6", size=(36, -1))
+        btn_next.Bind(wx.EVT_BUTTON, lambda e: self._go_next())
+        btn_last.Bind(wx.EVT_BUTTON, lambda e: self._go_last())
+        nav_sizer.Add(btn_next, 0, wx.RIGHT, 1)
+        nav_sizer.Add(btn_last, 0, wx.RIGHT, 8)
 
-        self.sector_label = ttk.Label(nav, text="/ 0")
-        self.sector_label.pack(side=tk.LEFT, padx=4)
+        self.sector_label = wx.StaticText(self, label="/ 0")
+        nav_sizer.Add(self.sector_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
 
-        ttk.Separator(nav, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        nav_sizer.Add(wx.StaticText(self, label="Show:"),
+                       0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.rb_sector = wx.RadioButton(self, label="Sector", style=wx.RB_GROUP)
+        self.rb_absolute = wx.RadioButton(self, label="Absolute")
+        self.rb_sector.Bind(wx.EVT_RADIOBUTTON, self._on_offset_mode)
+        self.rb_absolute.Bind(wx.EVT_RADIOBUTTON, self._on_offset_mode)
+        nav_sizer.Add(self.rb_sector, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        nav_sizer.Add(self.rb_absolute, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
 
-        # Offset display mode
-        ttk.Label(nav, text="Show:").pack(side=tk.LEFT, padx=(0, 2))
-        self.offset_mode = tk.StringVar(value="sector")
-        ttk.Radiobutton(nav, text="Sector", variable=self.offset_mode,
-                         value="sector", command=self._refresh).pack(side=tk.LEFT)
-        ttk.Radiobutton(nav, text="Absolute", variable=self.offset_mode,
-                         value="absolute", command=self._refresh).pack(side=tk.LEFT)
+        btn_bm = wx.Button(self, label="Bookmark", size=(80, -1))
+        btn_bm.Bind(wx.EVT_BUTTON, lambda e: self._add_bookmark())
+        btn_bm_list = wx.Button(self, label="Bookmarks\u2026", size=(100, -1))
+        btn_bm_list.Bind(wx.EVT_BUTTON, lambda e: self._show_bookmarks())
+        nav_sizer.Add(btn_bm, 0, wx.RIGHT, 2)
+        nav_sizer.Add(btn_bm_list, 0)
+        main_sizer.Add(nav_sizer, 0, wx.EXPAND | wx.BOTTOM, 4)
 
-        ttk.Separator(nav, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        # --- Tools bar ---
+        tools_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        tools_sizer.Add(wx.StaticText(self, label="Search hex:"),
+                         0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.search_ctrl = wx.TextCtrl(self, size=(200, -1),
+                                        style=wx.TE_PROCESS_ENTER)
+        self.search_ctrl.Bind(wx.EVT_TEXT_ENTER, lambda e: self._search_hex())
+        tools_sizer.Add(self.search_ctrl, 0, wx.RIGHT, 2)
+        btn_find = wx.Button(self, label="Find", size=(50, -1))
+        btn_find.Bind(wx.EVT_BUTTON, lambda e: self._search_hex())
+        btn_find_next = wx.Button(self, label="Find Next", size=(70, -1))
+        btn_find_next.Bind(wx.EVT_BUTTON, lambda e: self._search_next())
+        tools_sizer.Add(btn_find, 0, wx.RIGHT, 2)
+        tools_sizer.Add(btn_find_next, 0, wx.RIGHT, 12)
 
-        ttk.Button(nav, text="Bookmark", command=self._add_bookmark).pack(side=tk.LEFT, padx=2)
-        ttk.Button(nav, text="Bookmarks…", command=self._show_bookmarks).pack(side=tk.LEFT, padx=2)
+        tools_sizer.Add(wx.StaticText(self, label="Export sectors:"),
+                         0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.export_from_ctrl = wx.TextCtrl(self, value="0", size=(60, -1))
+        tools_sizer.Add(self.export_from_ctrl, 0, wx.RIGHT, 2)
+        tools_sizer.Add(wx.StaticText(self, label="to"),
+                         0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 4)
+        self.export_to_ctrl = wx.TextCtrl(self, value="0", size=(60, -1))
+        tools_sizer.Add(self.export_to_ctrl, 0, wx.RIGHT, 4)
+        btn_export = wx.Button(self, label="Export\u2026", size=(70, -1))
+        btn_export.Bind(wx.EVT_BUTTON, lambda e: self._export_range())
+        tools_sizer.Add(btn_export, 0)
+        main_sizer.Add(tools_sizer, 0, wx.EXPAND | wx.BOTTOM, 4)
 
-        # Tools bar
-        tools = ttk.Frame(self)
-        tools.pack(fill=tk.X, pady=(0, 4))
+        # --- Hex display ---
+        mono = wx.Font(10, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL,
+                        wx.FONTWEIGHT_NORMAL, faceName="Consolas")
+        # Try to use Consolas; fall back to system monospace
+        if not mono.IsOk() or mono.GetFaceName() != "Consolas":
+            mono = wx.Font(10, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL,
+                            wx.FONTWEIGHT_NORMAL)
 
-        ttk.Label(tools, text="Search hex:").pack(side=tk.LEFT)
-        self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(tools, textvariable=self.search_var, width=30)
-        self.search_entry.pack(side=tk.LEFT, padx=2)
-        self.search_entry.bind('<Return>', lambda e: self._search_hex())
-        ttk.Button(tools, text="Find", command=self._search_hex).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tools, text="Find Next", command=self._search_next).pack(side=tk.LEFT, padx=2)
-
-        ttk.Separator(tools, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-
-        ttk.Label(tools, text="Export sectors:").pack(side=tk.LEFT)
-        self.export_from_var = tk.StringVar(value="0")
-        ttk.Entry(tools, textvariable=self.export_from_var, width=6).pack(side=tk.LEFT, padx=1)
-        ttk.Label(tools, text="to").pack(side=tk.LEFT)
-        self.export_to_var = tk.StringVar(value="0")
-        ttk.Entry(tools, textvariable=self.export_to_var, width=6).pack(side=tk.LEFT, padx=1)
-        ttk.Button(tools, text="Export…", command=self._export_range).pack(side=tk.LEFT, padx=2)
-
-        # Main hex display
-        hex_frame = ttk.Frame(self)
-        hex_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.hex_text = tk.Text(
-            hex_frame,
-            font=("Consolas", 10),
-            wrap=tk.NONE,
-            state=tk.DISABLED,
-            bg='#1e1e2e',
-            fg='#cdd6f4',
-            insertbackground='#cdd6f4',
-            selectbackground='#45475a',
-            selectforeground='#cdd6f4',
-            padx=8,
-            pady=4,
+        self.hex_text = wx.TextCtrl(
+            self,
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2
+                  | wx.TE_DONTWRAP | wx.HSCROLL,
         )
+        self.hex_text.SetFont(mono)
+        self.hex_text.SetBackgroundColour(wx.Colour(30, 30, 46))
+        self.hex_text.SetForegroundColour(wx.Colour(205, 214, 244))
+        main_sizer.Add(self.hex_text, 1, wx.EXPAND | wx.BOTTOM, 4)
 
-        yscroll = ttk.Scrollbar(hex_frame, orient=tk.VERTICAL, command=self.hex_text.yview)
-        xscroll = ttk.Scrollbar(hex_frame, orient=tk.HORIZONTAL, command=self.hex_text.xview)
-        self.hex_text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        # --- Annotation bar ---
+        self.annot_label = wx.StaticText(self, label="")
+        annot_font = wx.Font(9, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL,
+                              wx.FONTWEIGHT_NORMAL)
+        self.annot_label.SetFont(annot_font)
+        main_sizer.Add(self.annot_label, 0, wx.EXPAND)
 
-        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        xscroll.pack(side=tk.BOTTOM, fill=tk.X)
-        self.hex_text.pack(fill=tk.BOTH, expand=True)
+        self.SetSizer(main_sizer)
 
-        # Configure text tags for highlighting
-        self.hex_text.tag_configure('offset', foreground='#89b4fa')
-        self.hex_text.tag_configure('hex_byte', foreground='#cdd6f4')
-        self.hex_text.tag_configure('hex_zero', foreground='#585b70')
-        self.hex_text.tag_configure('hex_high', foreground='#f9e2af')
-        self.hex_text.tag_configure('hex_ascii_printable', foreground='#a6e3a1')
-        self.hex_text.tag_configure('ascii', foreground='#a6e3a1')
-        self.hex_text.tag_configure('ascii_dot', foreground='#585b70')
-        self.hex_text.tag_configure('separator', foreground='#45475a')
-        self.hex_text.tag_configure('search_hit', background='#f9e2af', foreground='#1e1e2e')
-        self.hex_text.tag_configure('annotation', foreground='#f38ba8')
-        self.hex_text.tag_configure('header', foreground='#89b4fa', font=("Consolas", 10, "bold"))
-        self.hex_text.tag_configure('bpb_field', foreground='#cba6f7')
-        self.hex_text.tag_configure('signature', foreground='#f38ba8', font=("Consolas", 10, "bold"))
+    # ── Colour helpers ───────────────────────────────────────────────
 
-        # Annotation panel at bottom
-        self.annot_var = tk.StringVar(value="")
-        annot_label = ttk.Label(self, textvariable=self.annot_var, anchor=tk.W,
-                                 font=("Consolas", 9), wraplength=700)
-        annot_label.pack(fill=tk.X, pady=(4, 0))
+    # Catppuccin Mocha palette used by the original tkinter viewer
+    _CLR_OFFSET  = wx.Colour(137, 180, 250)   # blue
+    _CLR_BYTE    = wx.Colour(205, 214, 244)   # text
+    _CLR_ZERO    = wx.Colour(88, 91, 112)     # dim
+    _CLR_HIGH    = wx.Colour(249, 226, 175)   # yellow
+    _CLR_ASCII   = wx.Colour(166, 227, 161)   # green
+    _CLR_DOT     = wx.Colour(88, 91, 112)     # dim
+    _CLR_SEP     = wx.Colour(69, 71, 90)
+    _CLR_HEADER  = wx.Colour(137, 180, 250)
+    _CLR_BPB     = wx.Colour(203, 166, 247)   # mauve
+    _CLR_SIG     = wx.Colour(243, 139, 168)   # red
+    _CLR_SEARCH  = wx.Colour(249, 226, 175)   # yellow bg
+    _CLR_SRCHFG  = wx.Colour(30, 30, 46)      # dark fg for search hits
 
-        # Search state
-        self._search_bytes = None
-        self._search_pos = 0  # absolute byte offset for "find next"
+    def _append(self, text, colour=None, bold=False):
+        """Append coloured text to the hex display."""
+        start = self.hex_text.GetLastPosition()
+        self.hex_text.AppendText(text)
+        end = self.hex_text.GetLastPosition()
+        if colour or bold:
+            attr = wx.TextAttr()
+            if colour:
+                attr.SetTextColour(colour)
+            if bold:
+                f = self.hex_text.GetFont()
+                f.SetWeight(wx.FONTWEIGHT_BOLD)
+                attr.SetFont(f)
+            self.hex_text.SetStyle(start, end, attr)
+
+    # ── Navigation ───────────────────────────────────────────────────
 
     def _update_nav_limits(self):
         if self.disk:
-            total = self.disk.total_sectors
-            self.sector_label.configure(text=f"/ {total - 1}")
+            self.sector_label.SetLabel(f"/ {self.disk.total_sectors - 1}")
         else:
-            self.sector_label.configure(text="/ 0")
-
-    # -- Navigation --
+            self.sector_label.SetLabel("/ 0")
 
     def _go_first(self):
         self._show_sector(0)
@@ -204,8 +230,7 @@ class HexViewerWidget(ttk.Frame):
 
     def _go_to_sector(self):
         try:
-            s = self.sector_var.get().strip()
-            # Support hex input
+            s = self.sector_ctrl.GetValue().strip()
             if s.startswith('0x') or s.startswith('0X'):
                 sector = int(s, 16)
             else:
@@ -213,19 +238,25 @@ class HexViewerWidget(ttk.Frame):
             if self.disk and 0 <= sector < self.disk.total_sectors:
                 self._show_sector(sector)
             else:
-                messagebox.showwarning("Invalid Sector",
-                    f"Sector must be 0–{self.disk.total_sectors - 1 if self.disk else 0}")
+                wx.MessageBox(
+                    f"Sector must be 0\u2013"
+                    f"{self.disk.total_sectors - 1 if self.disk else 0}",
+                    "Invalid Sector", wx.OK | wx.ICON_WARNING)
         except ValueError:
-            messagebox.showwarning("Invalid Input", "Enter a decimal or hex (0x...) sector number.")
+            wx.MessageBox("Enter a decimal or hex (0x\u2026) sector number.",
+                          "Invalid Input", wx.OK | wx.ICON_WARNING)
 
-    # -- Display --
+    def _on_offset_mode(self, event):
+        self._offset_absolute = self.rb_absolute.GetValue()
+        self._refresh()
+
+    # ── Display ──────────────────────────────────────────────────────
 
     def _show_sector(self, sector_num):
         if not self.disk:
             return
-
         self.current_sector = sector_num
-        self.sector_var.set(str(sector_num))
+        self.sector_ctrl.SetValue(str(sector_num))
         data = self.disk.read_sector(sector_num)
         self._render_hex(data, sector_num)
 
@@ -233,74 +264,70 @@ class HexViewerWidget(ttk.Frame):
         self._show_sector(self.current_sector)
 
     def _render_hex(self, data, sector_num):
-        self.hex_text.configure(state=tk.NORMAL)
-        self.hex_text.delete('1.0', tk.END)
+        self.hex_text.SetEditable(True)
+        self.hex_text.Clear()
 
         sector_size = len(data)
         abs_offset_base = sector_num * sector_size
-        use_absolute = self.offset_mode.get() == "absolute"
+        use_absolute = self._offset_absolute
 
-        # Header line
+        # Header
         header = f"{'Offset':>10s}  "
         for i in range(self.BYTES_PER_ROW):
             header += f"{i:02X} "
         header += " ASCII\n"
-        self.hex_text.insert(tk.END, header, 'header')
-        self.hex_text.insert(tk.END, "─" * 78 + "\n", 'separator')
+        self._append(header, self._CLR_HEADER, bold=True)
+        self._append("\u2500" * 78 + "\n", self._CLR_SEP)
 
-        # Sector annotation
+        # Annotations
         annot_parts = []
         if sector_num in KNOWN_SIGNATURES:
             annot_parts.append(KNOWN_SIGNATURES[sector_num])
 
-        # Detect BPB on sector 0
-        is_boot = (sector_num == 0 and len(data) >= 64 and data[0] in (0xEB, 0xE9))
+        is_boot = (sector_num == 0 and len(data) >= 64
+                    and data[0] in (0xEB, 0xE9))
 
         for row_start in range(0, sector_size, self.BYTES_PER_ROW):
-            # Offset column
+            # Offset
             if use_absolute:
                 off_val = abs_offset_base + row_start
                 off_str = f"0x{off_val:08X}"
             else:
                 off_str = f"0x{row_start:04X}"
-            self.hex_text.insert(tk.END, f"{off_str:>10s}  ", 'offset')
+            self._append(f"{off_str:>10s}  ", self._CLR_OFFSET)
 
             # Hex bytes
             row_data = data[row_start:row_start + self.BYTES_PER_ROW]
             for i, byte in enumerate(row_data):
-                if byte == 0x00:
-                    tag = 'hex_zero'
-                elif byte >= 0x80:
-                    tag = 'hex_high'
-                else:
-                    tag = 'hex_byte'
-
-                # Check if this is a BPB field
                 if is_boot and (row_start + i) in BPB_FIELDS:
-                    tag = 'bpb_field'
+                    clr = self._CLR_BPB
+                elif byte == 0x00:
+                    clr = self._CLR_ZERO
+                elif byte >= 0x80:
+                    clr = self._CLR_HIGH
+                else:
+                    clr = self._CLR_BYTE
+                self._append(f"{byte:02X} ", clr)
 
-                self.hex_text.insert(tk.END, f"{byte:02X} ", tag)
-
-            # Pad short rows
             if len(row_data) < self.BYTES_PER_ROW:
-                pad = self.BYTES_PER_ROW - len(row_data)
-                self.hex_text.insert(tk.END, "   " * pad)
+                self._append("   " * (self.BYTES_PER_ROW - len(row_data)))
 
-            self.hex_text.insert(tk.END, " ", 'separator')
+            self._append(" ", self._CLR_SEP)
 
-            # ASCII column
+            # ASCII
             for byte in row_data:
                 if 0x20 <= byte <= 0x7E:
-                    self.hex_text.insert(tk.END, chr(byte), 'ascii')
+                    self._append(chr(byte), self._CLR_ASCII)
                 else:
-                    self.hex_text.insert(tk.END, '·', 'ascii_dot')
+                    self._append("\u00B7", self._CLR_DOT)
 
-            self.hex_text.insert(tk.END, "\n")
+            self._append("\n")
 
-        # BPB annotation for boot sector
+        # BPB fields for boot sector
         if is_boot:
-            self.hex_text.insert(tk.END, "\n", '')
-            self.hex_text.insert(tk.END, "─── BPB Fields ─────────────────────\n", 'header')
+            self._append("\n", None)
+            self._append("\u2500\u2500\u2500 BPB Fields "
+                          "\u2500" * 25 + "\n", self._CLR_HEADER, True)
             for off, (name, fmt) in sorted(BPB_FIELDS.items()):
                 try:
                     if fmt == 'B':
@@ -309,30 +336,34 @@ class HexViewerWidget(ttk.Frame):
                     else:
                         val = struct.unpack_from(fmt, data, off)[0]
                         val_str = f"{val} (0x{val:04X})"
-                    line = f"  0x{off:04X}  {name:<18s} = {val_str}\n"
-                    self.hex_text.insert(tk.END, line, 'bpb_field')
+                    self._append(
+                        f"  0x{off:04X}  {name:<18s} = {val_str}\n",
+                        self._CLR_BPB)
                 except (struct.error, IndexError):
                     pass
 
-            # Detect signatures
             sigs = self._find_signatures(data)
             if sigs:
-                self.hex_text.insert(tk.END, "\n─── Signatures ─────────────────────\n", 'header')
+                self._append("\n\u2500\u2500\u2500 Signatures "
+                              "\u2500" * 25 + "\n", self._CLR_HEADER, True)
                 for off, label in sigs:
-                    self.hex_text.insert(tk.END,
-                        f"  0x{off:04X}  {label}\n", 'signature')
+                    self._append(f"  0x{off:04X}  {label}\n",
+                                  self._CLR_SIG, True)
 
-        # Update annotation bar
+        # Annotation bar
         if sector_num in self.bookmarks:
             annot_parts.append(f"Bookmark: {self.bookmarks[sector_num]}")
-        self.annot_var.set("  │  ".join(annot_parts) if annot_parts else
-                           f"Sector {sector_num} — {sector_size} bytes"
-                           f" — Abs offset 0x{abs_offset_base:X}")
+        if annot_parts:
+            self.annot_label.SetLabel("  \u2502  ".join(annot_parts))
+        else:
+            self.annot_label.SetLabel(
+                f"Sector {sector_num} \u2014 {sector_size} bytes"
+                f" \u2014 Abs offset 0x{abs_offset_base:X}")
 
-        self.hex_text.configure(state=tk.DISABLED)
+        self.hex_text.SetInsertionPoint(0)
+        self.hex_text.SetEditable(False)
 
     def _find_signatures(self, data):
-        """Scan sector data for known byte patterns."""
         results = []
         for pattern, label in BYTE_PATTERNS.items():
             idx = 0
@@ -345,20 +376,17 @@ class HexViewerWidget(ttk.Frame):
         results.sort(key=lambda x: x[0])
         return results
 
-    # -- Search --
+    # ── Search ───────────────────────────────────────────────────────
 
     def _search_hex(self):
-        """Search for a hex pattern across the entire image."""
-        query = self.search_var.get().strip()
+        query = self.search_ctrl.GetValue().strip()
         if not query or not self.disk:
             return
-
         try:
-            # Accept formats: "CD 21", "CD21", "0xCD 0x21"
-            cleaned = query.replace('0x', '').replace('0X', '').replace(',', ' ')
+            cleaned = query.replace('0x', '').replace('0X', '') \
+                           .replace(',', ' ')
             hex_bytes = bytes.fromhex(cleaned.replace(' ', ''))
         except ValueError:
-            # Try as ASCII string
             hex_bytes = query.encode('ascii', errors='replace')
 
         self._search_bytes = hex_bytes
@@ -373,12 +401,10 @@ class HexViewerWidget(ttk.Frame):
     def _do_search(self):
         if not self._search_bytes or not self.disk:
             return
-
         pattern = self._search_bytes
         sector_size = self.disk.sector_size
         total = self.disk.total_sectors
 
-        # Search sector by sector from current position
         start_sector = self._search_pos // sector_size
         start_offset = self._search_pos % sector_size
 
@@ -389,129 +415,80 @@ class HexViewerWidget(ttk.Frame):
             if pos != -1:
                 self._search_pos = s * sector_size + pos
                 self._show_sector(s)
-                self._highlight_search(pos, len(pattern))
-                self.annot_var.set(
+                self.annot_label.SetLabel(
                     f"Found at sector {s}, offset 0x{pos:X} "
-                    f"(absolute 0x{s * sector_size + pos:X})"
-                )
+                    f"(absolute 0x{s * sector_size + pos:X})")
                 return
 
-        messagebox.showinfo("Not Found", "Pattern not found (searched to end of image).")
+        wx.MessageBox("Pattern not found (searched to end of image).",
+                      "Not Found", wx.OK | wx.ICON_INFORMATION)
 
-    def _highlight_search(self, byte_offset, length):
-        """Highlight the found bytes in the hex view."""
-        self.hex_text.configure(state=tk.NORMAL)
-        self.hex_text.tag_remove('search_hit', '1.0', tk.END)
-
-        row = byte_offset // self.BYTES_PER_ROW
-        col = byte_offset % self.BYTES_PER_ROW
-        text_line = row + 3  # +1 for header, +1 for separator, +1 for 1-indexed
-
-        for i in range(length):
-            byte_col = col + i
-            byte_row = row
-            if byte_col >= self.BYTES_PER_ROW:
-                byte_row += byte_col // self.BYTES_PER_ROW
-                byte_col = byte_col % self.BYTES_PER_ROW
-            line = byte_row + 3
-            # Each hex byte is "XX " = 3 chars, offset column is 12 chars
-            char_start = 12 + byte_col * 3
-            start = f"{line}.{char_start}"
-            end = f"{line}.{char_start + 2}"
-            self.hex_text.tag_add('search_hit', start, end)
-
-        # Scroll to the found line
-        self.hex_text.see(f"{text_line}.0")
-        self.hex_text.configure(state=tk.DISABLED)
-
-    # -- Bookmarks --
+    # ── Bookmarks ────────────────────────────────────────────────────
 
     def _add_bookmark(self):
         if not self.disk:
             return
-        label = f"Sector {self.current_sector}"
-        # Simple dialog
-        dlg = tk.Toplevel(self)
-        dlg.title("Add Bookmark")
-        dlg.geometry("300x100")
-        dlg.transient(self)
-
-        ttk.Label(dlg, text=f"Label for sector {self.current_sector}:").pack(pady=(10, 2))
-        var = tk.StringVar(value=label)
-        entry = ttk.Entry(dlg, textvariable=var, width=30)
-        entry.pack(pady=2)
-        entry.select_range(0, tk.END)
-        entry.focus()
-
-        def save():
-            self.bookmarks[self.current_sector] = var.get()
+        default = f"Sector {self.current_sector}"
+        dlg = wx.TextEntryDialog(
+            self, f"Label for sector {self.current_sector}:",
+            "Add Bookmark", default)
+        dlg.CentreOnParent()
+        if dlg.ShowModal() == wx.ID_OK:
+            self.bookmarks[self.current_sector] = dlg.GetValue()
             self._refresh()
-            dlg.destroy()
-
-        entry.bind('<Return>', lambda e: save())
-        ttk.Button(dlg, text="Save", command=save).pack(pady=8)
+        dlg.Destroy()
 
     def _show_bookmarks(self):
         if not self.bookmarks:
-            messagebox.showinfo("Bookmarks", "No bookmarks yet.\nUse the Bookmark button to mark sectors.")
+            wx.MessageBox("No bookmarks yet.\nUse the Bookmark button "
+                          "to mark sectors.",
+                          "Bookmarks", wx.OK | wx.ICON_INFORMATION)
             return
 
-        dlg = tk.Toplevel(self)
-        dlg.title("Bookmarks")
-        dlg.geometry("350x300")
-        dlg.transient(self)
-
-        listbox = tk.Listbox(dlg)
-        listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
         sorted_bm = sorted(self.bookmarks.items())
-        for sector, label in sorted_bm:
-            listbox.insert(tk.END, f"Sector {sector:>6d}: {label}")
+        choices = [f"Sector {s:>6d}: {lbl}" for s, lbl in sorted_bm]
 
-        def go_to():
-            sel = listbox.curselection()
-            if sel:
-                sector = sorted_bm[sel[0]][0]
-                self._show_sector(sector)
-                dlg.destroy()
+        dlg = wx.SingleChoiceDialog(
+            self, "Select a bookmark to jump to:", "Bookmarks", choices)
+        dlg.CentreOnParent()
+        if dlg.ShowModal() == wx.ID_OK:
+            idx = dlg.GetSelection()
+            self._show_sector(sorted_bm[idx][0])
+        dlg.Destroy()
 
-        listbox.bind('<Double-1>', lambda e: go_to())
-        btn_frame = ttk.Frame(dlg)
-        btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(btn_frame, text="Go To", command=go_to).pack(side=tk.LEFT)
-        ttk.Button(btn_frame, text="Close", command=dlg.destroy).pack(side=tk.RIGHT)
-
-    # -- Export --
+    # ── Export ───────────────────────────────────────────────────────
 
     def _export_range(self):
         if not self.disk:
             return
-
         try:
-            from_s = int(self.export_from_var.get())
-            to_s = int(self.export_to_var.get())
+            from_s = int(self.export_from_ctrl.GetValue())
+            to_s = int(self.export_to_ctrl.GetValue())
         except ValueError:
-            messagebox.showwarning("Invalid Range", "Enter valid sector numbers.")
+            wx.MessageBox("Enter valid sector numbers.",
+                          "Invalid Range", wx.OK | wx.ICON_WARNING)
             return
 
         if from_s < 0 or to_s >= self.disk.total_sectors or from_s > to_s:
-            messagebox.showwarning("Invalid Range",
-                f"Sectors must be 0–{self.disk.total_sectors - 1}, from ≤ to.")
+            wx.MessageBox(
+                f"Sectors must be 0\u2013{self.disk.total_sectors - 1}, "
+                f"from \u2264 to.",
+                "Invalid Range", wx.OK | wx.ICON_WARNING)
             return
 
-        path = filedialog.asksaveasfilename(
-            title="Export Sector Range",
-            initialfile=f"sectors_{from_s}-{to_s}.bin",
-            defaultextension=".bin",
-            filetypes=[("Binary", "*.bin"), ("All Files", "*.*")],
-        )
-        if not path:
-            return
-
-        data = self.disk.read_sectors(from_s, to_s - from_s + 1)
-        with open(path, 'wb') as f:
-            f.write(data)
-
-        size = len(data)
-        messagebox.showinfo("Exported",
-            f"Exported sectors {from_s}–{to_s} ({size:,} bytes) to:\n{path}")
+        dlg = wx.FileDialog(
+            self, "Export Sector Range",
+            defaultFile=f"sectors_{from_s}-{to_s}.bin",
+            wildcard="Binary (*.bin)|*.bin|All Files (*.*)|*.*",
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
+        dlg.CentreOnParent()
+        if dlg.ShowModal() == wx.ID_OK:
+            path = dlg.GetPath()
+            data = self.disk.read_sectors(from_s, to_s - from_s + 1)
+            with open(path, 'wb') as f:
+                f.write(data)
+            wx.MessageBox(
+                f"Exported sectors {from_s}\u2013{to_s} "
+                f"({len(data):,} bytes) to:\n{path}",
+                "Exported", wx.OK | wx.ICON_INFORMATION)
+        dlg.Destroy()
