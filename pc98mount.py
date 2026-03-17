@@ -33,7 +33,7 @@ import logging
 import wx
 import wx.dataview as dv
 
-from disk_image import open_image
+from disk_image import open_image, create_blank_image, BLANK_GEOMETRIES, BLANK_FORMATS
 from fat_fs import FATFilesystem
 from hex_viewer import HexViewerPanel
 from mount_backend import (
@@ -141,14 +141,258 @@ class ImageInfo:
 
 
 # =============================================================================
+# Blank Image Dialog
+# =============================================================================
+
+# Map format names to default file extensions
+_FORMAT_EXTENSIONS = {
+    "HDM":          ".hdm",
+    "D88":          ".d88",
+    "FDI":          ".fdi",
+    "HDI":          ".hdi",
+    "RAW (.img)":   ".img",
+}
+
+
+class BlankImageDialog(wx.Dialog):
+    """Dialog for creating a new blank disk image."""
+
+    def __init__(self, parent):
+        super().__init__(parent, title="Create Blank Disk Image",
+                         size=(500, 320),
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.SetMinSize((460, 300))
+        self._path = None
+        self._build_ui()
+
+    def _build_ui(self):
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # ── Format ────────────────────────────────────────────────
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, label="Format:", size=(90, -1)),
+                0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.fmt_combo = wx.ComboBox(
+            self, choices=BLANK_FORMATS,
+            value=BLANK_FORMATS[0], style=wx.CB_READONLY)
+        row.Add(self.fmt_combo, 1)
+        sizer.Add(row, 0, wx.EXPAND | wx.ALL, 8)
+
+        # ── Geometry preset ───────────────────────────────────────
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, label="Geometry:", size=(90, -1)),
+                0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        geom_names = list(BLANK_GEOMETRIES.keys())
+        self.geom_combo = wx.ComboBox(
+            self, choices=geom_names,
+            value=geom_names[0], style=wx.CB_READONLY)
+        self.geom_combo.Bind(wx.EVT_COMBOBOX, self._on_geom_change)
+        row.Add(self.geom_combo, 1)
+        sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # ── Custom CHS controls inside a panel (hidden by default) ──
+        self.custom_panel = wx.Panel(self)
+        cp_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        box = wx.StaticBox(self.custom_panel, label="Custom Geometry")
+        box_sizer = wx.StaticBoxSizer(box, wx.VERTICAL)
+
+        grid = wx.FlexGridSizer(cols=4, hgap=8, vgap=6)
+        grid.AddGrowableCol(1)
+        grid.AddGrowableCol(3)
+
+        grid.Add(wx.StaticText(self.custom_panel, label="Cylinders:"),
+                 0, wx.ALIGN_CENTER_VERTICAL)
+        self.spin_cyls = wx.SpinCtrl(
+            self.custom_panel, min=1, max=16383, initial=615,
+            size=(90, -1))
+        self.spin_cyls.Bind(wx.EVT_SPINCTRL, self._on_custom_change)
+        grid.Add(self.spin_cyls, 0)
+
+        grid.Add(wx.StaticText(self.custom_panel, label="Heads:"),
+                 0, wx.ALIGN_CENTER_VERTICAL)
+        self.spin_heads = wx.SpinCtrl(
+            self.custom_panel, min=1, max=255, initial=4,
+            size=(90, -1))
+        self.spin_heads.Bind(wx.EVT_SPINCTRL, self._on_custom_change)
+        grid.Add(self.spin_heads, 0)
+
+        grid.Add(wx.StaticText(self.custom_panel, label="Sectors/Track:"),
+                 0, wx.ALIGN_CENTER_VERTICAL)
+        self.spin_spt = wx.SpinCtrl(
+            self.custom_panel, min=1, max=255, initial=17,
+            size=(90, -1))
+        self.spin_spt.Bind(wx.EVT_SPINCTRL, self._on_custom_change)
+        grid.Add(self.spin_spt, 0)
+
+        grid.Add(wx.StaticText(self.custom_panel, label="Sector Size:"),
+                 0, wx.ALIGN_CENTER_VERTICAL)
+        self.combo_secsize = wx.ComboBox(
+            self.custom_panel, choices=["256", "512", "1024"],
+            value="512", style=wx.CB_READONLY, size=(90, -1))
+        self.combo_secsize.Bind(wx.EVT_COMBOBOX, self._on_custom_change)
+        grid.Add(self.combo_secsize, 0)
+
+        box_sizer.Add(grid, 0, wx.EXPAND | wx.ALL, 4)
+        cp_sizer.Add(box_sizer, 0, wx.EXPAND)
+        self.custom_panel.SetSizer(cp_sizer)
+
+        sizer.Add(self.custom_panel, 0,
+                  wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        self.custom_panel.Hide()
+
+        # ── Geometry detail label ─────────────────────────────────
+        self.geom_detail = wx.StaticText(self, label="")
+        self.geom_detail.SetForegroundColour(wx.Colour(100, 100, 100))
+        sizer.Add(self.geom_detail, 0,
+                  wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        self._update_geom_detail()
+
+        # ── Format with FAT checkbox ─────────────────────────────
+        self.fat_check = wx.CheckBox(
+            self, label="Format with empty FAT filesystem")
+        self.fat_check.SetValue(True)
+        self.fat_check.SetToolTip(
+            "Write a valid FAT12/16 boot sector and empty FAT table\n"
+            "so the image is ready to use immediately.")
+        sizer.Add(self.fat_check, 0,
+                  wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # ── Save location ─────────────────────────────────────────
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, label="Save to:", size=(90, -1)),
+                0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.path_ctrl = wx.TextCtrl(self, value="", style=wx.TE_READONLY)
+        row.Add(self.path_ctrl, 1, wx.RIGHT, 4)
+        btn_browse = wx.Button(self, label="Browse\u2026")
+        btn_browse.Bind(wx.EVT_BUTTON, self._on_browse)
+        row.Add(btn_browse, 0)
+        sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # ── Buttons ───────────────────────────────────────────────
+        btn_sizer = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
+        self.FindWindowById(wx.ID_OK).SetLabel("Create")
+        self.FindWindowById(wx.ID_OK).Bind(wx.EVT_BUTTON, self._on_ok)
+        sizer.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 8)
+
+        self.SetSizer(sizer)
+        self.Layout()
+        self.Fit()
+
+    # ── Event handlers ────────────────────────────────────────────
+
+    def _on_geom_change(self, event):
+        is_custom = self.geom_combo.GetValue() == "Custom"
+        self.custom_panel.Show(is_custom)
+        self.Layout()
+        self.Fit()
+        self._update_geom_detail()
+
+    def _on_custom_change(self, event):
+        self._update_geom_detail()
+
+    def _update_geom_detail(self):
+        name = self.geom_combo.GetValue()
+        if name == "Custom":
+            cyls, heads, spt, ss = self._get_custom_chs()
+        elif name in BLANK_GEOMETRIES and BLANK_GEOMETRIES[name]:
+            cyls, heads, spt, ss = BLANK_GEOMETRIES[name]
+        else:
+            self.geom_detail.SetLabel("")
+            return
+
+        total = cyls * heads * spt * ss
+        if total >= 1024 * 1024:
+            size_str = f"{total / (1024 * 1024):.1f} MB"
+        else:
+            size_str = f"{total / 1024:.0f} KB"
+        self.geom_detail.SetLabel(
+            f"  {cyls} cyl \u00d7 {heads} heads \u00d7 {spt} spt "
+            f"\u00d7 {ss} B/sector  =  {total:,} bytes ({size_str})")
+
+    def _get_custom_chs(self):
+        """Read the CHS values from the spin controls."""
+        return (
+            self.spin_cyls.GetValue(),
+            self.spin_heads.GetValue(),
+            self.spin_spt.GetValue(),
+            int(self.combo_secsize.GetValue()),
+        )
+
+    def _on_browse(self, event):
+        fmt = self.fmt_combo.GetValue()
+        ext = _FORMAT_EXTENSIONS.get(fmt, ".img")
+        wildcard = (f"{fmt} files (*{ext})|*{ext}|"
+                    f"All Files (*.*)|*.*")
+        dlg = wx.FileDialog(
+            self, "Save Blank Image As",
+            defaultFile=f"blank{ext}",
+            wildcard=wildcard,
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
+        dlg.CentreOnParent()
+        if dlg.ShowModal() == wx.ID_OK:
+            self._path = dlg.GetPath()
+            self.path_ctrl.SetValue(self._path)
+        dlg.Destroy()
+
+    def _on_ok(self, event):
+        if not self._path:
+            wx.MessageBox(
+                "Please choose a location to save the image.",
+                "No Path", wx.OK | wx.ICON_WARNING)
+            return
+
+        # Validate custom geometry
+        geom = self.get_geometry()
+        if isinstance(geom, tuple):
+            cyls, heads, spt, ss = geom
+            total = cyls * heads * spt * ss
+            if total == 0:
+                wx.MessageBox(
+                    "Image size would be 0 bytes.\n"
+                    "Check your geometry values.",
+                    "Invalid Geometry", wx.OK | wx.ICON_WARNING)
+                return
+            if total > 2 * 1024 * 1024 * 1024:
+                wx.MessageBox(
+                    f"Image would be {total / (1024**3):.1f} GB.\n"
+                    f"FAT16 supports up to ~2 GB.",
+                    "Too Large", wx.OK | wx.ICON_WARNING)
+                return
+
+        self.EndModal(wx.ID_OK)
+
+    # ── Accessors ─────────────────────────────────────────────────
+
+    def get_format(self):
+        val = self.fmt_combo.GetValue()
+        if val.startswith("RAW"):
+            return "RAW"
+        return val
+
+    def get_geometry(self):
+        """Return a geometry name (str) or a (C,H,S,secsize) tuple."""
+        name = self.geom_combo.GetValue()
+        if name == "Custom":
+            return self._get_custom_chs()
+        return name
+
+    def get_format_fat(self):
+        return self.fat_check.GetValue()
+
+    def get_path(self):
+        return self._path
+
+
+# =============================================================================
 # Main Frame
 # =============================================================================
 
 class PC98MountFrame(wx.Frame):
     def __init__(self):
         super().__init__(None, title="PC-98 Disk Image Mounter",
-                         size=(960, 660))
-        self.SetMinSize((720, 500))
+                         size=(1060, 660))
+        self.SetMinSize((800, 500))
 
         self.images = []
         self.mount_mgr = MountManager()
@@ -164,67 +408,75 @@ class PC98MountFrame(wx.Frame):
         panel = wx.Panel(self)
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # --- Toolbar ---
-        tb_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        # --- Toolbar row 1: file management ---
+        tb_sizer1 = wx.BoxSizer(wx.HORIZONTAL)
 
         btn_add = wx.Button(panel, label="Add Image\u2026")
         btn_add.Bind(wx.EVT_BUTTON, self._on_add_image)
-        tb_sizer.Add(btn_add, 0, wx.RIGHT, 4)
+        tb_sizer1.Add(btn_add, 0, wx.RIGHT, 4)
+
+        btn_blank = wx.Button(panel, label="Blank Image\u2026")
+        btn_blank.SetToolTip(
+            "Create a new blank (empty) disk image"
+        )
+        btn_blank.Bind(wx.EVT_BUTTON, self._on_blank_image)
+        tb_sizer1.Add(btn_blank, 0, wx.RIGHT, 4)
 
         btn_remove = wx.Button(panel, label="Remove")
         btn_remove.Bind(wx.EVT_BUTTON, self._on_remove_image)
-        tb_sizer.Add(btn_remove, 0, wx.RIGHT, 4)
+        tb_sizer1.Add(btn_remove, 0, wx.RIGHT, 16)
 
-        tb_sizer.AddSpacer(16)
-
-        lbl_target = "Drive:" if is_windows() else "Slot:"
-        tb_sizer.Add(wx.StaticText(panel, label=lbl_target),
-                      0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-        self.target_combo = wx.ComboBox(
-            panel, size=(100 if is_windows() else 110, -1),
-            style=wx.CB_READONLY)
-        tb_sizer.Add(self.target_combo, 0, wx.RIGHT, 4)
-
-        # Refresh button — Windows only (refreshes drive letters)
-        if is_windows():
-            btn_refresh = wx.Button(panel, label="\u21BB", size=(32, -1))
-            btn_refresh.SetToolTip("Refresh available drive letters")
-            btn_refresh.Bind(wx.EVT_BUTTON, self._on_refresh_targets)
-            tb_sizer.Add(btn_refresh, 0, wx.RIGHT, 8)
-
-        tb_sizer.Add(wx.StaticText(panel, label="Mode:"),
-                      0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-        self.mode_combo = wx.ComboBox(
-            panel, choices=["fat", "flat", "sectors"],
-            value="fat", size=(90, -1), style=wx.CB_READONLY)
-        tb_sizer.Add(self.mode_combo, 0, wx.RIGHT, 8)
-
-        btn_mount = wx.Button(panel, label="Mount")
-        btn_mount.Bind(wx.EVT_BUTTON, self._on_mount)
-        tb_sizer.Add(btn_mount, 0, wx.RIGHT, 4)
-
-        btn_unmount = wx.Button(panel, label="Unmount")
-        btn_unmount.Bind(wx.EVT_BUTTON, self._on_unmount)
-        tb_sizer.Add(btn_unmount, 0, wx.RIGHT, 4)
-
-        # ── NEW: Update button ───────────────────────────────────
+        # ── Update button ───────────────────────────────────
         btn_update = wx.Button(panel, label="Update image\u2026")
         btn_update.SetToolTip(
             "Write changes from the mounted directory back into "
             "the disk image"
         )
         btn_update.Bind(wx.EVT_BUTTON, self._on_update)
-        tb_sizer.Add(btn_update, 0, wx.RIGHT, 4)
-
-        tb_sizer.AddSpacer(16)
+        tb_sizer1.Add(btn_update, 0, wx.RIGHT, 4)
 
         browse_label = ("Open in Explorer" if is_windows()
                         else "Open in File Manager")
         btn_browse = wx.Button(panel, label=browse_label)
         btn_browse.Bind(wx.EVT_BUTTON, self._on_open_file_manager)
-        tb_sizer.Add(btn_browse, 0)
+        tb_sizer1.Add(btn_browse, 0)
 
-        main_sizer.Add(tb_sizer, 0, wx.EXPAND | wx.ALL, 6)
+        main_sizer.Add(tb_sizer1, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
+
+        # --- Toolbar row 2: mount controls ---
+        tb_sizer2 = wx.BoxSizer(wx.HORIZONTAL)
+
+        lbl_target = "Drive:" if is_windows() else "Slot:"
+        tb_sizer2.Add(wx.StaticText(panel, label=lbl_target),
+                      0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.target_combo = wx.ComboBox(
+            panel, size=(100 if is_windows() else 110, -1),
+            style=wx.CB_READONLY)
+        tb_sizer2.Add(self.target_combo, 0, wx.RIGHT, 4)
+
+        # Refresh button — Windows only (refreshes drive letters)
+        if is_windows():
+            btn_refresh = wx.Button(panel, label="\u21BB", size=(32, -1))
+            btn_refresh.SetToolTip("Refresh available drive letters")
+            btn_refresh.Bind(wx.EVT_BUTTON, self._on_refresh_targets)
+            tb_sizer2.Add(btn_refresh, 0, wx.RIGHT, 8)
+
+        tb_sizer2.Add(wx.StaticText(panel, label="Mode:"),
+                      0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.mode_combo = wx.ComboBox(
+            panel, choices=["fat", "flat", "sectors"],
+            value="fat", size=(90, -1), style=wx.CB_READONLY)
+        tb_sizer2.Add(self.mode_combo, 0, wx.RIGHT, 8)
+
+        btn_mount = wx.Button(panel, label="Mount")
+        btn_mount.Bind(wx.EVT_BUTTON, self._on_mount)
+        tb_sizer2.Add(btn_mount, 0, wx.RIGHT, 4)
+
+        btn_unmount = wx.Button(panel, label="Unmount")
+        btn_unmount.Bind(wx.EVT_BUTTON, self._on_unmount)
+        tb_sizer2.Add(btn_unmount, 0)
+
+        main_sizer.Add(tb_sizer2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
 
         # --- Splitter: image list | notebook ---
         splitter = wx.SplitterWindow(
@@ -254,7 +506,7 @@ class PC98MountFrame(wx.Frame):
 
         splitter.SetMinimumPaneSize(120)
         splitter.SplitVertically(left_panel, right_panel, 180)
-        main_sizer.Add(splitter, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
+        main_sizer.Add(splitter, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
 
         # --- Status bar ---
         self.status_bar = self.CreateStatusBar()
@@ -379,6 +631,47 @@ class PC98MountFrame(wx.Frame):
         if dlg.ShowModal() == wx.ID_OK:
             for path in dlg.GetPaths():
                 self._load_image(path)
+        dlg.Destroy()
+
+    # ── Blank image creation ─────────────────────────────────────────
+
+    def _on_blank_image(self, event):
+        """Show a dialog to create a new blank disk image."""
+        dlg = BlankImageDialog(self)
+        dlg.CentreOnParent()
+        if dlg.ShowModal() == wx.ID_OK:
+            fmt = dlg.get_format()
+            geometry = dlg.get_geometry()
+            format_fat = dlg.get_format_fat()
+            save_path = dlg.get_path()
+
+            if not save_path:
+                dlg.Destroy()
+                return
+
+            try:
+                create_blank_image(save_path, fmt, geometry, format_fat)
+                self._load_image(save_path)
+
+                # Build a descriptive status message
+                if isinstance(geometry, tuple):
+                    c, h, s, ss = geometry
+                    total = c * h * s * ss
+                    geom_str = (f"{c}C/{h}H/{s}S {ss}B "
+                                f"({total / (1024*1024):.1f} MB)"
+                                if total >= 1024*1024
+                                else f"{c}C/{h}H/{s}S {ss}B "
+                                     f"({total // 1024} KB)")
+                else:
+                    geom_str = geometry
+                self._set_status(
+                    f"Created blank {fmt} image: "
+                    f"{Path(save_path).name} ({geom_str})")
+            except Exception as e:
+                wx.MessageBox(
+                    f"Failed to create blank image:\n\n{e}",
+                    "Error", wx.OK | wx.ICON_ERROR)
+                self._set_status(f"Blank image creation failed: {e}")
         dlg.Destroy()
 
     def _load_image(self, path):
