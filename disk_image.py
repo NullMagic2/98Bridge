@@ -149,9 +149,7 @@ class FDIImage(DiskImage):
         if sec_size not in (128, 256, 512, 1024, 2048, 4096):
             sec_size = 1024
         self._sector_size = sec_size
-
-        raw_data = self._data[self.HEADER_SIZE:]
-        self._total_sectors = len(raw_data) // self._sector_size
+        self._total_sectors = (len(self._data) - self.HEADER_SIZE) // self._sector_size
         self._raw_offset = self.HEADER_SIZE
         self._label = f"FDI ({cyls}C/{heads}H/{spt}S)"
 
@@ -262,29 +260,69 @@ class HDIImage(DiskImage):
     """
     HDI image format — hard disk image with a small header.
     Used by Anex86 and some other emulators.
+
+    Two layout variants exist:
+      T98-Next / Neko Project II:
+        0x00 – reserved,  0x04 – hdr_size,  0x08 – data_size,
+        0x0C – sec_size,  0x10 – spt,  0x14 – heads,  0x18 – cyls
+      Anex86 (fields shifted +4):
+        0x00 – reserved,  0x04 – hdd_type,  0x08 – hdr_size,
+        0x0C – data_size, 0x10 – sec_size,  0x14 – spt,
+        0x18 – heads,     0x1C – cyls
     """
+
+    _VALID_SECTOR_SIZES = (128, 256, 512, 1024, 2048, 4096)
 
     def _parse(self):
         if len(self._data) < 4096:
             raise ValueError("File too small for HDI format")
 
-        hdr_size = struct.unpack_from('<I', self._data, 0x04)[0]
-        data_size = struct.unpack_from('<I', self._data, 0x08)[0]
-        sec_size = struct.unpack_from('<I', self._data, 0x0C)[0]
-        spt = struct.unpack_from('<I', self._data, 0x10)[0]
-        heads = struct.unpack_from('<I', self._data, 0x14)[0]
-        cyls = struct.unpack_from('<I', self._data, 0x18)[0]
+        # Try T98-style layout first (hdr_size at 0x04).
+        hdr_size, sec_size, spt, heads, cyls = self._try_layout(0x04)
+        if hdr_size is None:
+            # Fall back to Anex86-style layout (hdr_size at 0x08).
+            hdr_size, sec_size, spt, heads, cyls = self._try_layout(0x08)
 
-        if sec_size not in (128, 256, 512, 1024, 2048, 4096):
-            sec_size = 512
-        if hdr_size == 0 or hdr_size > 0x10000:
+        if hdr_size is None:
+            # Neither layout produced sane values — use safe defaults.
             hdr_size = 4096
+            sec_size = 512
+            raw_len = len(self._data) - hdr_size
+            spt = heads = cyls = 0
+        else:
+            raw_len = len(self._data) - hdr_size
 
         self._sector_size = sec_size
         self._raw_offset = hdr_size
-        raw_len = len(self._data) - hdr_size
         self._total_sectors = raw_len // sec_size
-        self._label = f"HDI ({cyls}C/{heads}H/{spt}S)"
+        self._spt = spt
+        self._heads = heads
+        if spt and heads and cyls:
+            self._label = f"HDI ({cyls}C/{heads}H/{spt}S)"
+        else:
+            self._label = f"HDI ({self._total_sectors} sectors)"
+
+    def _try_layout(self, hdr_offset):
+        """Try reading HDI header fields starting at *hdr_offset*.
+        Returns ``(hdr_size, sec_size, spt, heads, cyls)`` or
+        ``(None, …)`` if the values don't look valid.
+        """
+        h = struct.unpack_from('<I', self._data, hdr_offset)[0]
+        # data_size at hdr_offset+4 is informational; skip it.
+        s = struct.unpack_from('<I', self._data, hdr_offset + 8)[0]
+        spt = struct.unpack_from('<I', self._data, hdr_offset + 12)[0]
+        heads = struct.unpack_from('<I', self._data, hdr_offset + 16)[0]
+        cyls = struct.unpack_from('<I', self._data, hdr_offset + 20)[0]
+
+        if h == 0 or h > 0x10000:
+            return (None, None, None, None, None)
+        if s not in self._VALID_SECTOR_SIZES:
+            return (None, None, None, None, None)
+        if spt == 0 or spt > 255 or heads == 0 or heads > 255:
+            return (None, None, None, None, None)
+        if cyls == 0 or cyls > 0xFFFF:
+            return (None, None, None, None, None)
+        return (h, s, spt, heads, cyls)
 
     def read_sector(self, lba):
         offset = self._raw_offset + lba * self._sector_size
@@ -303,7 +341,6 @@ class HDIImage(DiskImage):
 def open_image(path):
     """Auto-detect image format and return appropriate DiskImage instance."""
     ext = path.lower()
-    size = os.path.getsize(path) if isinstance(path, str) else 0
 
     if ext.endswith('.d88') or ext.endswith('.d68') or ext.endswith('.d77'):
         return D88Image(path)

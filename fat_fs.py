@@ -17,6 +17,8 @@ import struct
 import logging
 from datetime import datetime
 
+from partition import detect_partitions
+
 log = logging.getLogger("pc98mount.fat")
 
 # FAT constants
@@ -67,20 +69,10 @@ class FileEntry:
         return bool(self.attr & ATTR_VOLUME_ID)
 
     @property
-    def is_hidden(self):
-        return bool(self.attr & ATTR_HIDDEN)
-
-    @property
-    def is_lfn(self):
-        return (self.attr & ATTR_LFN) == ATTR_LFN
-
-    @property
     def display_name(self):
-        if self.is_directory:
-            return self.name if self.name in ('.', '..') else self.name
-        if self.ext:
-            return f"{self.name}.{self.ext}"
-        return self.name
+        if self.is_directory or not self.ext:
+            return self.name
+        return f"{self.name}.{self.ext}"
 
     @property
     def datetime(self):
@@ -115,6 +107,7 @@ class FATFilesystem:
     def __init__(self, disk_image):
         self.disk = disk_image
         self._image_total_bytes = disk_image.total_sectors * disk_image.sector_size
+        self._partition_byte_offset = 0
         self._parse_bpb()
         self._load_fat()
         self._build_root()
@@ -124,6 +117,7 @@ class FATFilesystem:
     def _read_fs_bytes(self, byte_offset, byte_length):
         if byte_length == 0:
             return b''
+        byte_offset += self._partition_byte_offset
         ds = self.disk.sector_size
         first_disk_sector = byte_offset // ds
         last_disk_sector = (byte_offset + byte_length - 1) // ds
@@ -144,6 +138,7 @@ class FATFilesystem:
         boundaries and partial-sector writes transparently."""
         if not data:
             return
+        byte_offset += self._partition_byte_offset
         ds = self.disk.sector_size
         pos = 0
         while pos < len(data):
@@ -170,7 +165,7 @@ class FATFilesystem:
 
     # ── BPB parsing with validation ──────────────────────────────────
 
-    def _bpb_is_sane(self, bps, spc, reserved, nfats, root_ents, fat_sz, total):
+    def _bpb_is_sane(self, bps, spc, reserved, nfats, root_ents, fat_sz, total, **_kw):
         if bps not in (128, 256, 512, 1024, 2048, 4096):
             return False
         if spc == 0 or spc > 128 or (spc & (spc - 1)) != 0:
@@ -194,51 +189,106 @@ class FATFilesystem:
             return False
         return True
 
-    def _parse_bpb(self):
-        boot = self._read_fs_bytes(0, min(1024, self._image_total_bytes))
+    def _try_partitioned_disk(self):
+        """Detect a partitioned disk and locate the FAT partition.
+
+        Delegates partition-table detection to ``partition.py`` and
+        then probes each discovered partition for a valid FAT BPB.
+        Returns True on success.
+        """
+        parts = detect_partitions(self.disk)
+        for part in parts:
+            log.info(f"Probing {part}")
+            if self._try_bpb_at(part.byte_offset, part.byte_size):
+                return True
+        return False
+
+    @staticmethod
+    def _read_bpb_fields(boot):
+        """Extract raw BPB fields from a boot sector.  Returns a dict."""
         bps = struct.unpack_from('<H', boot, 0x0B)[0]
-        spc = boot[0x0D]
-        reserved = struct.unpack_from('<H', boot, 0x0E)[0]
-        nfats = boot[0x10]
-        root_ents = struct.unpack_from('<H', boot, 0x11)[0]
         total16 = struct.unpack_from('<H', boot, 0x13)[0]
-        media = boot[0x15]
-        fat_sz = struct.unpack_from('<H', boot, 0x16)[0]
         total = total16
         if total == 0 and len(boot) >= 0x24:
             total = struct.unpack_from('<I', boot, 0x20)[0]
+        return {
+            'bps':       bps,
+            'spc':       boot[0x0D],
+            'reserved':  struct.unpack_from('<H', boot, 0x0E)[0],
+            'nfats':     boot[0x10],
+            'root_ents': struct.unpack_from('<H', boot, 0x11)[0],
+            'media':     boot[0x15],
+            'fat_sz':    struct.unpack_from('<H', boot, 0x16)[0],
+            'total':     total,
+        }
+
+    def _apply_bpb(self, f, fallback_total=0):
+        """Store validated BPB fields dict *f* into instance attributes."""
+        self.bytes_per_sector = f['bps']
+        self.sectors_per_cluster = f['spc']
+        self.reserved_sectors = f['reserved']
+        self.num_fats = f['nfats']
+        self.root_entry_count = f['root_ents']
+        self.fat_size_16 = f['fat_sz']
+        self.media_descriptor = f['media']
+        self.total_sectors = f['total'] if f['total'] > 0 else fallback_total
+
+    def _try_bpb_at(self, part_byte_off, part_size_hint=0):
+        """Try to read and validate a BPB at *part_byte_off*.
+
+        Sets ``_partition_byte_offset``, ``_image_total_bytes`` and all
+        BPB fields on success.  Returns True/False.
+        """
+        saved_offset = self._partition_byte_offset
+        saved_total = self._image_total_bytes
+
+        self._partition_byte_offset = part_byte_off
+        part_total_bytes = (
+            part_size_hint if part_size_hint
+            else saved_total - part_byte_off
+        )
+        self._image_total_bytes = part_total_bytes
+
+        try:
+            pbr = self._read_fs_bytes(0, min(1024, part_total_bytes))
+        except Exception:
+            self._partition_byte_offset = saved_offset
+            self._image_total_bytes = saved_total
+            return False
+
+        f = self._read_bpb_fields(pbr)
+        if self._bpb_is_sane(**f):
+            log.info(f"BPB valid at byte offset 0x{part_byte_off:X}")
+            self._apply_bpb(f, part_total_bytes // f['bps'] if f['bps'] else 0)
+            return True
+
+        self._partition_byte_offset = saved_offset
+        self._image_total_bytes = saved_total
+        return False
+
+    def _parse_bpb(self):
+        boot = self._read_fs_bytes(0, min(1024, self._image_total_bytes))
+        f = self._read_bpb_fields(boot)
 
         log.info(
-            f"BPB raw: bps={bps} spc={spc} reserved={reserved} nfats={nfats} "
-            f"root_ents={root_ents} fat_sz={fat_sz} total={total} media=0x{media:02X}"
+            f"BPB raw: bps={f['bps']} spc={f['spc']} reserved={f['reserved']} "
+            f"nfats={f['nfats']} root_ents={f['root_ents']} fat_sz={f['fat_sz']} "
+            f"total={f['total']} media=0x{f['media']:02X}"
         )
         log.info(
             f"Image: {self._image_total_bytes} bytes, "
             f"disk reports {self.disk.total_sectors} sectors × {self.disk.sector_size}B"
         )
 
-        if self._bpb_is_sane(bps, spc, reserved, nfats, root_ents, fat_sz, total):
+        if self._bpb_is_sane(**f):
             log.info("BPB valid")
-            self.bytes_per_sector = bps
-            self.sectors_per_cluster = spc
-            self.reserved_sectors = reserved
-            self.num_fats = nfats
-            self.root_entry_count = root_ents
-            self.fat_size_16 = fat_sz
-            self.media_descriptor = media
-            self.total_sectors = total if total > 0 else (self._image_total_bytes // bps)
+            self._apply_bpb(f, self._image_total_bytes // f['bps'] if f['bps'] else 0)
+        elif self._try_partitioned_disk():
+            # Re-read boot sector from the partition for volume label.
+            boot = self._read_fs_bytes(0, min(1024, self._image_total_bytes))
         else:
             log.warning("BPB invalid, trying known PC-98 geometries")
             self._apply_geometry_fallback()
-
-        try:
-            self.sectors_per_track = struct.unpack_from('<H', boot, 0x18)[0]
-            self.num_heads = struct.unpack_from('<H', boot, 0x1A)[0]
-            self.hidden_sectors = struct.unpack_from('<H', boot, 0x1C)[0]
-        except struct.error:
-            self.sectors_per_track = 8
-            self.num_heads = 2
-            self.hidden_sectors = 0
 
         # Compute layout (all in BPB sector units)
         self.root_dir_sectors = (
@@ -278,7 +328,6 @@ class FATFilesystem:
         self._validate_fat_header()
 
     def _apply_geometry_fallback(self):
-        matched = False
         for (geo_bytes, geo_bps, geo_spc, geo_res, geo_nfats,
              geo_root, geo_fat, geo_total, geo_media) in PC98_KNOWN_GEOMETRIES:
             if abs(self._image_total_bytes - geo_bytes) < 4096:
@@ -294,20 +343,18 @@ class FATFilesystem:
                 self.fat_size_16 = geo_fat
                 self.media_descriptor = geo_media
                 self.total_sectors = geo_total
-                matched = True
-                break
+                return
 
-        if not matched:
-            log.warning("No geometry match — using default PC-98 2HD layout")
-            bps = 1024 if self._image_total_bytes % 1024 == 0 else 512
-            self.bytes_per_sector = bps
-            self.sectors_per_cluster = 1
-            self.reserved_sectors = 1
-            self.num_fats = 2
-            self.root_entry_count = 192
-            self.fat_size_16 = 2
-            self.media_descriptor = 0xFE
-            self.total_sectors = self._image_total_bytes // bps
+        log.warning("No geometry match — using default PC-98 2HD layout")
+        bps = 1024 if self._image_total_bytes % 1024 == 0 else 512
+        self.bytes_per_sector = bps
+        self.sectors_per_cluster = 1
+        self.reserved_sectors = 1
+        self.num_fats = 2
+        self.root_entry_count = 192
+        self.fat_size_16 = 2
+        self.media_descriptor = 0xFE
+        self.total_sectors = self._image_total_bytes // bps
 
     def _validate_fat_header(self):
         try:

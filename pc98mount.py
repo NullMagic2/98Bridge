@@ -27,6 +27,7 @@ Usage:
 
 import sys
 import os
+import threading
 from pathlib import Path
 import logging
 
@@ -384,6 +385,21 @@ class BlankImageDialog(wx.Dialog):
         return self._path
 
 
+class BusyDialog(wx.Dialog):
+    """A lightweight 'please wait' overlay that minimizes with its parent."""
+
+    def __init__(self, parent, message):
+        super().__init__(parent, title="",
+                         style=wx.BORDER_SIMPLE | wx.FRAME_FLOAT_ON_PARENT)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        label = wx.StaticText(self, label=message)
+        label.SetFont(label.GetFont().MakeLarger())
+        sizer.Add(label, 0, wx.ALL, 20)
+        self.SetSizerAndFit(sizer)
+        self.CentreOnParent()
+        self.Show()
+
+
 # =============================================================================
 # Main Frame
 # =============================================================================
@@ -395,12 +411,22 @@ class PC98MountFrame(wx.Frame):
         self.SetMinSize((800, 500))
 
         self.images = []
-        self.mount_mgr = MountManager()
         self._tree_paths = {}
+        self._busy = False
+        self._busy_dlg = None
 
         self._build_ui()
-        self._update_mount_targets()
         self.Centre()
+
+        # MountManager constructor runs stale-mount cleanup which
+        # can be slow (VHD detach, subst removal, temp dir sweep).
+        self._busy_dlg = BusyDialog(self, "Cleaning up stale mounts\u2026")
+        wx.GetApp().Yield()
+        self.mount_mgr = MountManager()
+        self._busy_dlg.Destroy()
+        self._busy_dlg = None
+
+        self._update_mount_targets()
 
     # ── UI Construction ──────────────────────────────────────────────
 
@@ -860,9 +886,25 @@ class PC98MountFrame(wx.Frame):
 
         self.detail_text.SetValue('\n'.join(lines))
 
+    # ── Async helpers ───────────────────────────────────────────────
+
+    def _show_busy(self, message):
+        """Show a 'please wait' dialog that follows the main window."""
+        self._busy = True
+        self._busy_dlg = BusyDialog(self, message)
+
+    def _dismiss_busy(self):
+        """Dismiss the busy dialog."""
+        if self._busy_dlg:
+            self._busy_dlg.Destroy()
+            self._busy_dlg = None
+        self._busy = False
+
     # ── Mount / Unmount ──────────────────────────────────────────────
 
     def _on_mount(self, event):
+        if self._busy:
+            return
         info = self._selected_image()
         if not info:
             wx.MessageBox("Select a disk image first.",
@@ -892,75 +934,85 @@ class PC98MountFrame(wx.Frame):
 
         self._set_status(
             f"Mounting {Path(info.path).name} at {target} ({mode})\u2026")
+        self._show_busy("Please wait, mounting in progress\u2026")
 
-        busy = wx.BusyInfo("Please wait, mounting in progress\u2026")
-        wx.GetApp().Yield()
+        image_size = info.disk.total_sectors * info.disk.sector_size
 
-        try:
-            image_size = info.disk.total_sectors * info.disk.sector_size
-            self.mount_mgr.mount(
-                target, mode,
-                disk_image=info.disk,
-                fat_fs=info.fs,
-                image_size_bytes=image_size,
-            )
-            info.mount_id = target
-            info.mount_mode = mode
+        def _work():
+            try:
+                self.mount_mgr.mount(
+                    target, mode,
+                    disk_image=info.disk,
+                    fat_fs=info.fs,
+                    image_size_bytes=image_size,
+                )
+                wx.CallAfter(self._mount_done, info, target, mode, None)
+            except Exception as e:
+                wx.CallAfter(self._mount_done, info, target, mode, e)
 
-            idx = self.image_listbox.GetSelection()
-            if idx != wx.NOT_FOUND:
-                disp = self._mount_display(info)
-                self.image_listbox.SetString(
-                    idx, f"[{disp}] {Path(info.path).name}")
-                self.image_listbox.SetSelection(idx)
+        threading.Thread(target=_work, daemon=True).start()
 
-            self._populate_tree(info)
-            self._populate_detail(info)
-            self._update_mount_targets()
+    def _mount_done(self, info, target, mode, error):
+        self._dismiss_busy()
 
-            mode_desc = {
-                "fat": "FAT filesystem (files/folders)",
-                "flat": "raw flat file (DISK.IMG)",
-                "sectors": (f"individual sectors "
-                            f"({info.disk.total_sectors} files)"),
-            }
-            strategy = self.mount_mgr.strategy or ""
-            via = f" via {strategy.upper()}" if strategy else ""
-            mount_obj = self.mount_mgr.get_mount(target)
-            location = (mount_obj.mount_point if mount_obj
-                        else target)
-            self._set_status(
-                f"Mounted at {location}{via} \u2014 "
-                f"{mode_desc.get(mode, mode)}")
-
-            if mode == "fat" and mount_obj:
-                count = getattr(mount_obj, '_extract_count', -1)
-                errors = getattr(mount_obj, '_extract_errors', 0)
-                if count == 0:
-                    wx.MessageBox(
-                        f"The FAT parser found 0 files on this "
-                        f"image.\n"
-                        f"({errors} extraction errors)\n\n"
-                        f"This disk likely has no standard FAT "
-                        f"filesystem.\n"
-                        f"Try 'flat' or 'sectors' mode, or use the "
-                        f"Hex Viewer.",
-                        "No Files Extracted",
-                        wx.OK | wx.ICON_WARNING)
-                elif count > 0:
-                    extra = (f" ({errors} errors)" if errors else "")
-                    self._set_status(
-                        f"Mounted at {location}{via} \u2014 "
-                        f"{count} files extracted{extra}")
-
-        except Exception as e:
-            wx.MessageBox(f"Failed to mount:\n\n{e}",
+        if error:
+            wx.MessageBox(f"Failed to mount:\n\n{error}",
                           "Mount Error", wx.OK | wx.ICON_ERROR)
-            self._set_status(f"Mount failed: {e}")
-        finally:
-            del busy
+            self._set_status(f"Mount failed: {error}")
+            return
+
+        info.mount_id = target
+        info.mount_mode = mode
+
+        idx = self.image_listbox.GetSelection()
+        if idx != wx.NOT_FOUND:
+            disp = self._mount_display(info)
+            self.image_listbox.SetString(
+                idx, f"[{disp}] {Path(info.path).name}")
+            self.image_listbox.SetSelection(idx)
+
+        self._populate_tree(info)
+        self._populate_detail(info)
+        self._update_mount_targets()
+
+        mode_desc = {
+            "fat": "FAT filesystem (files/folders)",
+            "flat": "raw flat file (DISK.IMG)",
+            "sectors": (f"individual sectors "
+                        f"({info.disk.total_sectors} files)"),
+        }
+        strategy = self.mount_mgr.strategy or ""
+        via = f" via {strategy.upper()}" if strategy else ""
+        mount_obj = self.mount_mgr.get_mount(target)
+        location = (mount_obj.mount_point if mount_obj
+                    else target)
+        self._set_status(
+            f"Mounted at {location}{via} \u2014 "
+            f"{mode_desc.get(mode, mode)}")
+
+        if mode == "fat" and mount_obj:
+            count = getattr(mount_obj, '_extract_count', -1)
+            errors = getattr(mount_obj, '_extract_errors', 0)
+            if count == 0:
+                wx.MessageBox(
+                    f"The FAT parser found 0 files on this "
+                    f"image.\n"
+                    f"({errors} extraction errors)\n\n"
+                    f"This disk likely has no standard FAT "
+                    f"filesystem.\n"
+                    f"Try 'flat' or 'sectors' mode, or use the "
+                    f"Hex Viewer.",
+                    "No Files Extracted",
+                    wx.OK | wx.ICON_WARNING)
+            elif count > 0:
+                extra = (f" ({errors} errors)" if errors else "")
+                self._set_status(
+                    f"Mounted at {location}{via} \u2014 "
+                    f"{count} files extracted{extra}")
 
     def _on_unmount(self, event):
+        if self._busy:
+            return
         info = self._selected_image()
         if not info:
             return
@@ -971,7 +1023,27 @@ class PC98MountFrame(wx.Frame):
             return
 
         mid = info.mount_id
-        self.mount_mgr.unmount(mid)
+        self._set_status(f"Unmounting {mid}\u2026")
+        self._show_busy("Please wait, unmounting\u2026")
+
+        def _work():
+            try:
+                self.mount_mgr.unmount(mid)
+                wx.CallAfter(self._unmount_done, info, mid, None)
+            except Exception as e:
+                wx.CallAfter(self._unmount_done, info, mid, e)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _unmount_done(self, info, mid, error):
+        self._dismiss_busy()
+
+        if error:
+            wx.MessageBox(f"Failed to unmount:\n\n{error}",
+                          "Unmount Error", wx.OK | wx.ICON_ERROR)
+            self._set_status(f"Unmount failed: {error}")
+            return
+
         info.mount_id = None
         info.mount_mode = None
 
@@ -990,6 +1062,8 @@ class PC98MountFrame(wx.Frame):
     def _on_update(self, event):
         """Write modifications from the mount point back into the
         disk image, offering "Overwrite" / "Save As" / "Cancel"."""
+        if self._busy:
+            return
         info = self._selected_image()
         if not info:
             wx.MessageBox("Select a disk image first.",
@@ -1047,41 +1121,48 @@ class PC98MountFrame(wx.Frame):
 
         # --- Perform the write-back ---
         self._set_status("Writing changes back to image\u2026")
-        busy = wx.BusyInfo(
+        self._show_busy(
             "Please wait, writing changes to disk image\u2026")
-        wx.GetApp().Yield()
 
-        try:
-            result = self.mount_mgr.update(
-                info.mount_id,
-                info.mount_mode,
-                disk_image=info.disk,
-                fat_fs=info.fs,
-                save_path=save_path,
-            )
-            self._set_status(result)
+        def _work():
+            try:
+                result = self.mount_mgr.update(
+                    info.mount_id,
+                    info.mount_mode,
+                    disk_image=info.disk,
+                    fat_fs=info.fs,
+                    save_path=save_path,
+                )
+                wx.CallAfter(self._update_done,
+                             info, save_path, result, None)
+            except Exception as e:
+                wx.CallAfter(self._update_done,
+                             info, save_path, None, e)
 
-            # Refresh the tree and detail panels so the user sees the
-            # new state (the FAT writer reloads the in-memory FS).
-            self._populate_tree(info)
-            self._populate_detail(info)
+        threading.Thread(target=_work, daemon=True).start()
 
-            dest = save_path or info.path
-            wx.MessageBox(
-                f"Update complete.\n\n{result}\n\n"
-                f"Saved to:\n{dest}",
-                "Update Successful",
-                wx.OK | wx.ICON_INFORMATION,
-            )
+    def _update_done(self, info, save_path, result, error):
+        self._dismiss_busy()
 
-        except Exception as e:
+        if error:
             log.exception("Update failed")
             wx.MessageBox(
-                f"Failed to write changes back:\n\n{e}",
+                f"Failed to write changes back:\n\n{error}",
                 "Update Error", wx.OK | wx.ICON_ERROR)
-            self._set_status(f"Update failed: {e}")
-        finally:
-            del busy
+            self._set_status(f"Update failed: {error}")
+            return
+
+        self._set_status(result)
+        self._populate_tree(info)
+        self._populate_detail(info)
+
+        dest = save_path or info.path
+        wx.MessageBox(
+            f"Update complete.\n\n{result}\n\n"
+            f"Saved to:\n{dest}",
+            "Update Successful",
+            wx.OK | wx.ICON_INFORMATION,
+        )
 
     # ── Open in file manager ─────────────────────────────────────────
 
@@ -1198,8 +1279,23 @@ class PC98MountFrame(wx.Frame):
     # ── Cleanup ──────────────────────────────────────────────────────
 
     def _on_close(self, event):
-        self.mount_mgr.unmount_all()
-        self.Destroy()
+        if self._busy:
+            return
+        if not self.mount_mgr._mounts:
+            self.Destroy()
+            return
+
+        self._busy = True
+        self._busy_dlg = BusyDialog(self, "Unmounting, please wait\u2026")
+
+        def _work():
+            try:
+                self.mount_mgr.unmount_all()
+            except Exception:
+                pass
+            wx.CallAfter(self.Destroy)
+
+        threading.Thread(target=_work, daemon=True).start()
 
 
 # =============================================================================
