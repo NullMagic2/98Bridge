@@ -103,4 +103,4 @@ temp dir. For multi-megabyte HDD images, flat mode is faster.
 
 ## License
 
-Public domain / MIT.
+MIT.
