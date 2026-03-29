@@ -835,6 +835,27 @@ class FATFilesystem:
         # 4. Walk host directory and write contents.
         counters = {'files': 0, 'dirs': 0}
 
+        # DOS system files that must be first in the root directory
+        # *and* occupy the earliest clusters.  The boot loader locates
+        # them by root-directory position and/or expects them to start
+        # at cluster 2.  If they are not first, the disk won't boot.
+        _SYSTEM_FILES = {'IO.SYS', 'MSDOS.SYS'}
+
+        def _sort_root_first(items, real_path):
+            """Sort items so that system files come first (in the
+            canonical order IO.SYS, MSDOS.SYS), followed by everything
+            else in alphabetical order."""
+            system = []
+            rest = []
+            for name in items:
+                if name.upper() in _SYSTEM_FILES:
+                    system.append(name)
+                else:
+                    rest.append(name)
+            # Canonical order: IO.SYS before MSDOS.SYS.
+            system.sort(key=lambda n: 0 if n.upper() == 'IO.SYS' else 1)
+            return system + sorted(rest)
+
         def _process_dir(real_path, parent_cluster, is_root):
             """Process one real directory level.  Returns a list of
             32-byte entry blocks ready to write into a directory area."""
@@ -842,10 +863,18 @@ class FATFilesystem:
             used_names = set()
 
             try:
-                items = sorted(os.listdir(real_path))
+                raw_items = os.listdir(real_path)
             except OSError as exc:
                 log.warning(f"Cannot list {real_path}: {exc}")
                 return entries
+
+            # In the root directory, system files must come first so
+            # they get the lowest cluster numbers and earliest root
+            # directory slots — the boot loader depends on this.
+            if is_root:
+                items = _sort_root_first(raw_items, real_path)
+            else:
+                items = sorted(raw_items)
 
             for item_name in items:
                 item_path = os.path.join(real_path, item_name)
