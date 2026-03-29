@@ -150,8 +150,8 @@ def detect_pc98(disk_image):
 
     Detection heuristics:
       - Sector 0 contains "IPL1" at offset 3, or
-      - Sector 0 has the PC-98 0x55AA signature at offset 0xFE
-        (as opposed to the IBM 0x1FE location).
+      - Sector 0 has the 0x55AA signature at the last two bytes
+        of the sector (the standard PC-98 boot signature position).
     """
     if disk_image.total_sectors < 2:
         return []
@@ -159,10 +159,11 @@ def detect_pc98(disk_image):
     if len(boot) < 256:
         return []
 
+    ds = disk_image.sector_size
     is_pc98 = (
         boot[3:7] == b'IPL1'
-        or (len(boot) >= 0x100
-            and boot[0xFE] == 0x55 and boot[0xFF] == 0xAA)
+        or (len(boot) >= ds
+            and boot[ds - 2] == 0x55 and boot[ds - 1] == 0xAA)
     )
     if not is_pc98:
         return []

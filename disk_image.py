@@ -149,8 +149,12 @@ class FDIImage(DiskImage):
         if len(self._data) < self.HEADER_SIZE:
             raise ValueError("File too small for FDI format")
 
-        fdd_type, hdr_size, sec_size = struct.unpack_from('<III', self._data, 0)
-        spt, heads, cyls = struct.unpack_from('<III', self._data, 0x10)
+        # Anex86 FDI/HDI header layout (pc98.org canonical spec):
+        #   0x00 Reserved, 0x04 FDDType, 0x08 HeaderSize,
+        #   0x0C DataSize,  0x10 BytesPerSector,
+        #   0x14 Sectors,   0x18 Heads,  0x1C Cylinders
+        sec_size = struct.unpack_from('<I', self._data, 0x10)[0]
+        spt, heads, cyls = struct.unpack_from('<III', self._data, 0x14)
 
         if sec_size not in (128, 256, 512, 1024, 2048, 4096):
             sec_size = 1024
@@ -265,16 +269,16 @@ class D88Image(DiskImage):
 class HDIImage(DiskImage):
     """
     HDI image format — hard disk image with a small header.
-    Used by Anex86 and some other emulators.
+    Used by Anex86 and other emulators.
 
-    Two layout variants exist:
-      T98-Next / Neko Project II:
-        0x00 – reserved,  0x04 – hdr_size,  0x08 – data_size,
-        0x0C – sec_size,  0x10 – spt,  0x14 – heads,  0x18 – cyls
-      Anex86 (fields shifted +4):
-        0x00 – reserved,  0x04 – hdd_type,  0x08 – hdr_size,
-        0x0C – data_size, 0x10 – sec_size,  0x14 – spt,
-        0x18 – heads,     0x1C – cyls
+    The canonical header layout (pc98.org) is::
+
+        0x00 – reserved,   0x04 – hdd_type,  0x08 – hdr_size,
+        0x0C – data_size,  0x10 – sec_size,  0x14 – spt,
+        0x18 – heads,      0x1C – cyls
+
+    The reader also tries an alternate offset (hdr_size at 0x04) as a
+    fallback for malformed images found in the wild.
     """
 
     _VALID_SECTOR_SIZES = (128, 256, 512, 1024, 2048, 4096)
@@ -283,11 +287,11 @@ class HDIImage(DiskImage):
         if len(self._data) < 4096:
             raise ValueError("File too small for HDI format")
 
-        # Try T98-style layout first (hdr_size at 0x04).
-        hdr_size, sec_size, spt, heads, cyls = self._try_layout(0x04)
+        # Try canonical Anex86 layout first (hdr_size at 0x08).
+        hdr_size, sec_size, spt, heads, cyls = self._try_layout(0x08)
         if hdr_size is None:
-            # Fall back to Anex86-style layout (hdr_size at 0x08).
-            hdr_size, sec_size, spt, heads, cyls = self._try_layout(0x08)
+            # Fall back to alternate layout (hdr_size at 0x04).
+            hdr_size, sec_size, spt, heads, cyls = self._try_layout(0x04)
 
         if hdr_size is None:
             # Neither layout produced sane values — use safe defaults.
@@ -381,8 +385,15 @@ BLANK_FORMATS = ["HDM", "D88", "FDI", "HDI", "RAW (.img)"]
 
 def _build_fat_boot_sector(sector_size, spc, reserved, num_fats,
                            root_entries, fat_sectors, total_sectors,
-                           media, spt, heads):
-    """Build a minimal FAT12/16 boot sector (BPB) for a blank image."""
+                           media, spt, heads, hidden_sectors=0):
+    """Build a FAT12/16 boot sector (BPB + extended BPB) for a blank image.
+
+    Includes the extended BPB fields (drive number, 0x29 signature,
+    volume serial, volume label, filesystem type) that MS-DOS 5+
+    requires to recognise the volume as formatted.
+    """
+    import time
+
     boot = bytearray(sector_size)
     boot[0:3] = b'\xEB\x3C\x90'                     # JMP short + NOP
     boot[3:11] = b'PC98MTBL'                         # OEM name
@@ -397,9 +408,35 @@ def _build_fat_boot_sector(sector_size, spc, reserved, num_fats,
     struct.pack_into('<H', boot, 0x16, fat_sectors)
     struct.pack_into('<H', boot, 0x18, spt)
     struct.pack_into('<H', boot, 0x1A, heads)
-    struct.pack_into('<H', boot, 0x1C, 0)            # hidden sectors
+    struct.pack_into('<I', boot, 0x1C, hidden_sectors)  # hidden sectors
     if total_sectors >= 0x10000:
         struct.pack_into('<I', boot, 0x20, total_sectors)
+
+    # ── Extended BPB (required by MS-DOS 5+) ─────────────────────
+    is_hdd = (media == 0xF8)
+    boot[0x24] = 0x80 if is_hdd else 0x00            # physical drive number
+    boot[0x25] = 0x00                                 # reserved
+    boot[0x26] = 0x29                                 # extended boot signature
+
+    # Volume serial number — DOS derives this from the current
+    # date/time; we do the same so each image is unique.
+    serial = int(time.time()) & 0xFFFFFFFF
+    struct.pack_into('<I', boot, 0x27, serial)
+
+    boot[0x2B:0x36] = b'NO NAME    '                 # volume label (11 bytes)
+
+    # Determine FAT type for the filesystem type string.
+    root_dir_sects = (root_entries * 32 + sector_size - 1) // sector_size
+    data_sects = total_sectors - reserved - num_fats * fat_sectors - root_dir_sects
+    clusters = data_sects // spc if spc > 0 else 0
+    if clusters < 4085:
+        boot[0x36:0x3E] = b'FAT12   '
+    else:
+        boot[0x36:0x3E] = b'FAT16   '
+
+    # Boot sector signature — required by DOS and emulators.
+    boot[0x1FE] = 0x55
+    boot[0x1FF] = 0xAA
     return bytes(boot)
 
 
@@ -425,6 +462,11 @@ def create_blank_image(path, fmt, geometry_name_or_tuple, format_fat=True):
                                ``(cyls, heads, spt, sector_size)`` tuple.
     *format_fat*             – if True, write a valid FAT12/16 boot sector
                                and empty FAT so the image is ready to use.
+                               Applies to floppy formats only — HDI images
+                               are always created blank because PC-98 hard
+                               disks must be initialised with DISKINIT from
+                               within DOS before they can be partitioned
+                               and formatted.
 
     Returns the opened DiskImage instance.
     """
@@ -444,36 +486,46 @@ def create_blank_image(path, fmt, geometry_name_or_tuple, format_fat=True):
     if image_bytes == 0:
         raise ValueError("Image size would be 0 bytes.")
 
-    # --- Compute FAT parameters for any volume size ---------------
-    fat_params = _compute_fat_params(total_sectors, sector_size,
-                                     image_bytes, spt, heads)
-
-    spc          = fat_params['spc']
-    reserved     = fat_params['reserved']
-    num_fats     = fat_params['num_fats']
-    root_entries = fat_params['root_entries']
-    fat_sectors  = fat_params['fat_sectors']
-    media        = fat_params['media']
-    fat_type     = fat_params['fat_type']
-
-    boot_sector = (_build_fat_boot_sector(
-        sector_size, spc, reserved, num_fats,
-        root_entries, fat_sectors, total_sectors, media,
-        spt, heads) if format_fat else b'\x00' * sector_size)
-
-    fat_data = (_build_empty_fat(
-        fat_type, fat_sectors, sector_size, media
-    ) if format_fat else b'\x00' * (fat_sectors * sector_size))
+    is_hdd = fmt.upper() == "HDI"
 
     # ── Build the raw flat image ──────────────────────────────────
     raw = bytearray(image_bytes)
-    raw[0:sector_size] = boot_sector[:sector_size]
 
-    if format_fat:
-        fat_off = reserved * sector_size
-        for i in range(num_fats):
-            off = fat_off + i * fat_sectors * sector_size
-            raw[off:off + len(fat_data)] = fat_data
+    if is_hdd:
+        # PC-98 hard disks require initialisation from within DOS
+        # (DISKINIT + FDISK + FORMAT).  We write completely blank
+        # sector data, just like Anex86's own "New" button does.
+        # The HDI *header* carries the geometry; the data area is
+        # all zeros until the user runs the DOS format utility.
+        fat_type = 0
+    else:
+        # Floppy images can be pre-formatted because they don't
+        # need BIOS-level initialisation.
+        if format_fat:
+            fat_params = _compute_fat_params(
+                total_sectors, sector_size, image_bytes, spt, heads)
+            spc          = fat_params['spc']
+            reserved     = fat_params['reserved']
+            num_fats     = fat_params['num_fats']
+            root_entries = fat_params['root_entries']
+            fat_sectors  = fat_params['fat_sectors']
+            media        = fat_params['media']
+            fat_type     = fat_params['fat_type']
+
+            boot_sector = _build_fat_boot_sector(
+                sector_size, spc, reserved, num_fats,
+                root_entries, fat_sectors, total_sectors, media,
+                spt, heads)
+            fat_data = _build_empty_fat(
+                fat_type, fat_sectors, sector_size, media)
+
+            raw[0:sector_size] = boot_sector[:sector_size]
+            fat_off = reserved * sector_size
+            for i in range(num_fats):
+                off = fat_off + i * fat_sectors * sector_size
+                raw[off:off + len(fat_data)] = fat_data
+        else:
+            fat_type = 0
 
     # ── Write to the requested container format ───────────────────
     fmt_up = fmt.upper()
@@ -490,7 +542,8 @@ def create_blank_image(path, fmt, geometry_name_or_tuple, format_fat=True):
 
     log.info(f"Created blank {fmt} image: {path} "
              f"({cyls}C/{heads}H/{spt}S, {sector_size}B, "
-             f"{image_bytes:,} bytes, FAT{fat_type if format_fat else 'none'})")
+             f"{image_bytes:,} bytes"
+             f"{f', FAT{fat_type}' if fat_type else ', unformatted'})")
 
     return open_image(path)
 
@@ -597,6 +650,7 @@ def _compute_fat_params(total_sectors, sector_size, image_bytes, spt, heads):
     }
 
 
+
 # ── Container writers ────────────────────────────────────────────
 
 def _write_d88(path, raw, cyls, heads, spt, sector_size):
@@ -658,29 +712,57 @@ def _write_d88(path, raw, cyls, heads, spt, sector_size):
 
 
 def _write_fdi(path, raw, cyls, heads, spt, sector_size):
-    """Wrap flat *raw* data in an FDI container and write to *path*."""
+    """Wrap flat *raw* data in an FDI container and write to *path*.
+
+    Uses the Anex86-compatible header layout so that the image can be
+    loaded by Anex86, NP21/W, and other emulators.
+    """
     hdr = bytearray(FDIImage.HEADER_SIZE)
-    struct.pack_into('<I', hdr, 0x00, 0)           # fdd_type
-    struct.pack_into('<I', hdr, 0x04, FDIImage.HEADER_SIZE)
-    struct.pack_into('<I', hdr, 0x08, sector_size)  # sector size
-    struct.pack_into('<I', hdr, 0x10, spt)
-    struct.pack_into('<I', hdr, 0x14, heads)
-    struct.pack_into('<I', hdr, 0x18, cyls)
+
+    # Determine FDDType identifier expected by Anex86.
+    image_bytes = len(raw)
+    if sector_size == 1024 and image_bytes <= 1_261_568:
+        fdd_type = 0x90                               # 2HD 1.2 MB
+    elif image_bytes <= 737_280:
+        fdd_type = 0x10                               # 2DD 640K/720K
+    elif image_bytes <= 1_474_560:
+        fdd_type = 0x30                               # 1.44 MB
+    else:
+        fdd_type = 0x10                               # default / fallback
+
+    struct.pack_into('<I', hdr, 0x00, 0)              # reserved
+    struct.pack_into('<I', hdr, 0x04, fdd_type)       # FDDType (PDA)
+    struct.pack_into('<I', hdr, 0x08, FDIImage.HEADER_SIZE)  # header size
+    struct.pack_into('<I', hdr, 0x0C, len(raw))       # data size
+    struct.pack_into('<I', hdr, 0x10, sector_size)    # bytes per sector
+    struct.pack_into('<I', hdr, 0x14, spt)            # sectors per track
+    struct.pack_into('<I', hdr, 0x18, heads)          # heads / surfaces
+    struct.pack_into('<I', hdr, 0x1C, cyls)           # cylinders
     with open(path, 'wb') as f:
         f.write(hdr)
         f.write(raw)
 
 
 def _write_hdi(path, raw, cyls, heads, spt, sector_size):
-    """Wrap flat *raw* data in an HDI container and write to *path*."""
+    """Wrap flat *raw* data in an HDI container and write to *path*.
+
+    Uses the Anex86-compatible header layout so that the image can be
+    loaded by Anex86, NP21/W, and other emulators.
+    """
     hdr_size = 4096
     hdr = bytearray(hdr_size)
-    struct.pack_into('<I', hdr, 0x04, hdr_size)
-    struct.pack_into('<I', hdr, 0x08, len(raw))
-    struct.pack_into('<I', hdr, 0x0C, sector_size)
-    struct.pack_into('<I', hdr, 0x10, spt)
-    struct.pack_into('<I', hdr, 0x14, heads)
-    struct.pack_into('<I', hdr, 0x18, cyls)
+
+    # For HDI the FDDType field is typically the capacity in MB.
+    size_mb = len(raw) // (1024 * 1024)
+
+    struct.pack_into('<I', hdr, 0x00, 0)              # reserved
+    struct.pack_into('<I', hdr, 0x04, size_mb)        # FDDType (capacity MB)
+    struct.pack_into('<I', hdr, 0x08, hdr_size)       # header size
+    struct.pack_into('<I', hdr, 0x0C, len(raw))       # data size
+    struct.pack_into('<I', hdr, 0x10, sector_size)    # bytes per sector
+    struct.pack_into('<I', hdr, 0x14, spt)            # sectors per track
+    struct.pack_into('<I', hdr, 0x18, heads)          # heads
+    struct.pack_into('<I', hdr, 0x1C, cyls)           # cylinders
     with open(path, 'wb') as f:
         f.write(hdr)
         f.write(raw)

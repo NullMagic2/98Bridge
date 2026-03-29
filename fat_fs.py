@@ -108,9 +108,63 @@ class FATFilesystem:
         self.disk = disk_image
         self._image_total_bytes = disk_image.total_sectors * disk_image.sector_size
         self._partition_byte_offset = 0
+        # How the BPB parameters were determined:
+        #   'bpb'       – read from a valid BPB on disk (trustworthy)
+        #   'partition'  – found via partition table probing (trustworthy)
+        #   'geometry'   – matched a known floppy geometry (best-effort)
+        #   'guessed'    – fell through to a generic default (unreliable)
+        self._bpb_source = 'guessed'
         self._parse_bpb()
         self._load_fat()
         self._build_root()
+
+    @property
+    def bpb_is_valid(self):
+        """True if the BPB was read from actual disk data rather than
+        guessed.  Write-back should only be allowed when this is True."""
+        return self._bpb_source in ('bpb', 'partition')
+
+    # ── Generic filesystem plugin interface ──────────────────────────
+    # These properties define the contract that any filesystem plugin
+    # (FAT, N88-BASIC, etc.) should implement so that the UI and
+    # mount backend can work with them without type-checking.
+    #
+    # Required by plugins:
+    #   can_write_back  – bool: is write-back safe?
+    #   write_back_status – str: human-readable reason if not safe
+    #   fs_type_label   – str: e.g. "FAT12", "FAT16", "N88-BASIC"
+    #   volume_label    – str: volume name (may be empty)
+    #   root            – root directory entry with .children
+    #   walk()          – yields (path, FileEntry) for all files
+    #   read_file(entry) – returns bytes for a file entry
+    #   write_back_from_directory(dir_path, save_path=None)
+
+    @property
+    def can_write_back(self):
+        """True if write-back is safe for this filesystem.
+
+        Filesystem plugins should return False if the on-disk layout
+        could not be reliably determined (e.g. no valid superblock)."""
+        return self.bpb_is_valid
+
+    @property
+    def write_back_status(self):
+        """Human-readable explanation of write-back availability.
+
+        Returns an empty string if write-back is available, or a
+        short reason string if it is not (e.g. "guessed", "geometry").
+        """
+        if self.can_write_back:
+            return ""
+        return (
+            f"FAT layout was {self._bpb_source} "
+            f"(not read from a valid BPB on the disk)"
+        )
+
+    @property
+    def fs_type_label(self):
+        """Short human-readable filesystem type string for the UI."""
+        return f"FAT{self.fat_type}"
 
     # ── Byte-level read layer ────────────────────────────────────────
 
@@ -283,9 +337,11 @@ class FATFilesystem:
         if self._bpb_is_sane(**f):
             log.info("BPB valid")
             self._apply_bpb(f, self._image_total_bytes // f['bps'] if f['bps'] else 0)
+            self._bpb_source = 'bpb'
         elif self._try_partitioned_disk():
             # Re-read boot sector from the partition for volume label.
             boot = self._read_fs_bytes(0, min(1024, self._image_total_bytes))
+            self._bpb_source = 'partition'
         else:
             log.warning("BPB invalid, trying known PC-98 geometries")
             self._apply_geometry_fallback()
@@ -357,9 +413,11 @@ class FATFilesystem:
                 self.fat_size_16 = geo_fat
                 self.media_descriptor = geo_media
                 self.total_sectors = geo_total
+                self._bpb_source = 'geometry'
                 return
 
-        log.warning("No geometry match — using default PC-98 2HD layout")
+        log.warning("No geometry match — using default PC-98 2HD layout. "
+                    "Write-back will be DISABLED to prevent corruption.")
         bps = 1024 if self._image_total_bytes % 1024 == 0 else 512
         self.bytes_per_sector = bps
         self.sectors_per_cluster = 1
@@ -369,6 +427,7 @@ class FATFilesystem:
         self.fat_size_16 = 2
         self.media_descriptor = 0xFE
         self.total_sectors = self._image_total_bytes // bps
+        self._bpb_source = 'guessed'
 
     def _validate_fat_header(self):
         try:
@@ -728,7 +787,18 @@ class FATFilesystem:
           the original file is overwritten.
 
         Returns a ``(files_written, dirs_written)`` tuple.
+
+        Raises ``RuntimeError`` if the filesystem parameters were
+        guessed rather than read from the disk, to prevent corruption.
         """
+        if not self.bpb_is_valid:
+            raise RuntimeError(
+                f"Write-back refused: the FAT layout was {self._bpb_source}"
+                f" (not read from a valid BPB on the disk).\n\n"
+                f"This image may use a non-FAT filesystem (e.g. N88-BASIC)\n"
+                f"or an unsupported disk geometry. Writing back with\n"
+                f"guessed parameters would corrupt the image."
+            )
         cluster_size = self.sectors_per_cluster * self.bytes_per_sector
         max_cluster = self.total_clusters + 2
 

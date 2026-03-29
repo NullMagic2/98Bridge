@@ -39,6 +39,10 @@ import registry                                         # noqa: F401
 import plugin_loader
 
 from disk_image import open_image, create_blank_image, BLANK_GEOMETRIES, BLANK_FORMATS
+from disk_image import (
+    RawImage, FDIImage, HDIImage, D88Image,
+    _write_fdi, _write_hdi, _write_d88,
+)
 from hex_viewer import HexViewerPanel
 from mount_backend import (
     MountManager, is_windows,
@@ -186,13 +190,27 @@ _FORMAT_EXTENSIONS = {
 class BlankImageDialog(wx.Dialog):
     """Dialog for creating a new blank disk image."""
 
+    # Which geometries are valid for which container formats.
+    _FLOPPY_FORMATS = {"HDM", "D88", "FDI", "RAW (.img)"}
+    _HDD_FORMATS    = {"HDI"}
+
+    _FLOPPY_GEOMS = [k for k, v in BLANK_GEOMETRIES.items()
+                     if v is not None and k.startswith("PC-98")]
+    _HDD_GEOMS    = [k for k, v in BLANK_GEOMETRIES.items()
+                     if v is not None and k.startswith("HDD")]
+
+    # Default geometry to select for each format category.
+    _DEFAULT_FLOPPY = "PC-98 2HD (1.2 MB)"
+    _DEFAULT_HDD    = "HDD 40 MB"
+
     def __init__(self, parent):
         super().__init__(parent, title="Create Blank Disk Image",
-                         size=(500, 320),
+                         size=(500, 340),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.SetMinSize((460, 300))
         self._path = None
         self._build_ui()
+        self._on_format_change(None)   # sync geometry list to initial format
 
     def _build_ui(self):
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -204,6 +222,7 @@ class BlankImageDialog(wx.Dialog):
         self.fmt_combo = wx.ComboBox(
             self, choices=BLANK_FORMATS,
             value=BLANK_FORMATS[0], style=wx.CB_READONLY)
+        self.fmt_combo.Bind(wx.EVT_COMBOBOX, self._on_format_change)
         row.Add(self.fmt_combo, 1)
         sizer.Add(row, 0, wx.EXPAND | wx.ALL, 8)
 
@@ -211,10 +230,8 @@ class BlankImageDialog(wx.Dialog):
         row = wx.BoxSizer(wx.HORIZONTAL)
         row.Add(wx.StaticText(self, label="Geometry:", size=(90, -1)),
                 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-        geom_names = list(BLANK_GEOMETRIES.keys())
         self.geom_combo = wx.ComboBox(
-            self, choices=geom_names,
-            value=geom_names[0], style=wx.CB_READONLY)
+            self, choices=[], style=wx.CB_READONLY)
         self.geom_combo.Bind(wx.EVT_COMBOBOX, self._on_geom_change)
         row.Add(self.geom_combo, 1)
         sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
@@ -275,9 +292,8 @@ class BlankImageDialog(wx.Dialog):
         self.geom_detail.SetForegroundColour(wx.Colour(100, 100, 100))
         sizer.Add(self.geom_detail, 0,
                   wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
-        self._update_geom_detail()
 
-        # ── Format with FAT checkbox ─────────────────────────────
+        # ── Format with FAT checkbox (floppy only) ───────────────
         self.fat_check = wx.CheckBox(
             self, label="Format with empty FAT filesystem")
         self.fat_check.SetValue(True)
@@ -286,6 +302,18 @@ class BlankImageDialog(wx.Dialog):
             "so the image is ready to use immediately.")
         sizer.Add(self.fat_check, 0,
                   wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # ── HDI hint label (shown only for hard disk) ────────────
+        self.hdi_hint = wx.StaticText(
+            self,
+            label="\u26a0  Hard disk images are created blank. You must\n"
+                  "    initialise and format them from within DOS\n"
+                  "    using FORMAT.EXE (select \u201c\u56fa\u5b9a"
+                  "\u30c7\u30a3\u30b9\u30af\u201d).")
+        self.hdi_hint.SetForegroundColour(wx.Colour(160, 120, 0))
+        sizer.Add(self.hdi_hint, 0,
+                  wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        self.hdi_hint.Hide()
 
         # ── Save location ─────────────────────────────────────────
         row = wx.BoxSizer(wx.HORIZONTAL)
@@ -308,7 +336,46 @@ class BlankImageDialog(wx.Dialog):
         self.Layout()
         self.Fit()
 
+    # ── Helpers ───────────────────────────────────────────────────
+
+    def _is_hdd_format(self):
+        return self.fmt_combo.GetValue() in self._HDD_FORMATS
+
+    def _sync_geometry_list(self):
+        """Repopulate the geometry combo to show only geometries
+        compatible with the selected container format."""
+        if self._is_hdd_format():
+            geoms = self._HDD_GEOMS + ["Custom"]
+            default = self._DEFAULT_HDD
+        else:
+            geoms = self._FLOPPY_GEOMS + ["Custom"]
+            default = self._DEFAULT_FLOPPY
+
+        self.geom_combo.Set(geoms)
+        if default in geoms:
+            self.geom_combo.SetValue(default)
+        else:
+            self.geom_combo.SetSelection(0)
+
     # ── Event handlers ────────────────────────────────────────────
+
+    def _on_format_change(self, event):
+        """Called when the Format combo changes — sync geometry list
+        and show/hide the FAT checkbox and HDI hint."""
+        self._sync_geometry_list()
+
+        is_hdd = self._is_hdd_format()
+        # HDI images can't be pre-formatted (needs DISKINIT in DOS).
+        self.fat_check.Show(not is_hdd)
+        self.hdi_hint.Show(is_hdd)
+
+        # Sync custom panel visibility.
+        is_custom = self.geom_combo.GetValue() == "Custom"
+        self.custom_panel.Show(is_custom)
+
+        self._update_geom_detail()
+        self.Layout()
+        self.Fit()
 
     def _on_geom_change(self, event):
         is_custom = self.geom_combo.GetValue() == "Custom"
@@ -407,10 +474,280 @@ class BlankImageDialog(wx.Dialog):
         return name
 
     def get_format_fat(self):
+        # HDI images cannot be pre-formatted — they need DISKINIT in DOS.
+        if self._is_hdd_format():
+            return False
         return self.fat_check.GetValue()
 
     def get_path(self):
         return self._path
+
+
+# =============================================================================
+# Convert Image Dialog
+# =============================================================================
+
+# Known floppy geometries by raw size: (cyls, heads, spt, sector_size)
+_RAW_FLOPPY_GEOMETRIES = {
+    1261568: (77,  2,  8, 1024),  # PC-98 2HD 1.2 MB
+    1228800: (77,  2,  8, 1024),  # PC-98 2HD alternate
+    737280:  (80,  2,  9,  512),  # 2DD 720 KB
+    655360:  (80,  2,  8,  512),  # 2DD 640 KB
+    1474560: (80,  2, 18,  512),  # 1.44 MB
+}
+
+_CONVERT_TARGETS = ["FDI", "HDI", "D88", "HDM / RAW"]
+
+
+class ConvertDialog(wx.Dialog):
+    """Dialog for converting a disk image to a different container format."""
+
+    def __init__(self, parent, source_path=None, source_disk=None):
+        super().__init__(parent, title="Convert Disk Image",
+                         size=(520, 280),
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.SetMinSize((460, 260))
+        self._source_path = source_path or ""
+        self._source_disk = source_disk
+        self._save_path = None
+        self._build_ui()
+        self._update_info()
+
+    def _build_ui(self):
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # ── Source file ──────────────────────────────────────────
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, label="Source:", size=(80, -1)),
+                0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.source_ctrl = wx.TextCtrl(
+            self, value=self._source_path, style=wx.TE_READONLY)
+        row.Add(self.source_ctrl, 1, wx.RIGHT, 4)
+        btn_src = wx.Button(self, label="Browse\u2026")
+        btn_src.Bind(wx.EVT_BUTTON, self._on_browse_source)
+        row.Add(btn_src, 0)
+        sizer.Add(row, 0, wx.EXPAND | wx.ALL, 8)
+
+        # ── Source info ──────────────────────────────────────────
+        self.info_label = wx.StaticText(self, label="")
+        self.info_label.SetForegroundColour(wx.Colour(100, 100, 100))
+        sizer.Add(self.info_label, 0,
+                  wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # ── Target format ────────────────────────────────────────
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, label="Convert to:", size=(80, -1)),
+                0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.fmt_combo = wx.ComboBox(
+            self, choices=_CONVERT_TARGETS,
+            value=_CONVERT_TARGETS[0], style=wx.CB_READONLY)
+        row.Add(self.fmt_combo, 1)
+        sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # ── Save location ────────────────────────────────────────
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(self, label="Save to:", size=(80, -1)),
+                0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.save_ctrl = wx.TextCtrl(
+            self, value="", style=wx.TE_READONLY)
+        row.Add(self.save_ctrl, 1, wx.RIGHT, 4)
+        btn_dst = wx.Button(self, label="Browse\u2026")
+        btn_dst.Bind(wx.EVT_BUTTON, self._on_browse_dest)
+        row.Add(btn_dst, 0)
+        sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # ── Buttons ──────────────────────────────────────────────
+        btn_sizer = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
+        self.FindWindowById(wx.ID_OK).SetLabel("Convert")
+        self.FindWindowById(wx.ID_OK).Bind(wx.EVT_BUTTON, self._on_ok)
+        sizer.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 8)
+
+        self.SetSizer(sizer)
+        self.Layout()
+        self.Fit()
+
+    # ── Helpers ───────────────────────────────────────────────────
+
+    def _load_source(self, path):
+        """Try to open *path* with the plugin registry."""
+        try:
+            self._source_disk = open_image(path)
+            self._source_path = path
+            self.source_ctrl.SetValue(path)
+            self._update_info()
+            return True
+        except Exception as exc:
+            wx.MessageBox(
+                f"Cannot open image:\n{path}\n\n{exc}",
+                "Open Error", wx.OK | wx.ICON_ERROR)
+            return False
+
+    def _update_info(self):
+        disk = self._source_disk
+        if not disk:
+            self.info_label.SetLabel("  No source image loaded.")
+            return
+        raw_bytes = disk.total_sectors * disk.sector_size
+        if raw_bytes >= 1024 * 1024:
+            size_str = f"{raw_bytes / (1024 * 1024):.1f} MB"
+        else:
+            size_str = f"{raw_bytes / 1024:.0f} KB"
+
+        geom = self._detect_geometry()
+        if geom:
+            c, h, s, ss = geom
+            self.info_label.SetLabel(
+                f"  {disk.label}  \u2014  {c}C/{h}H/{s}S "
+                f"\u00d7 {ss}B  =  {raw_bytes:,} bytes ({size_str})")
+        else:
+            self.info_label.SetLabel(
+                f"  {disk.label}  \u2014  {disk.total_sectors:,} sectors "
+                f"\u00d7 {disk.sector_size}B  =  "
+                f"{raw_bytes:,} bytes ({size_str})")
+
+    def _detect_geometry(self):
+        """Return (cyls, heads, spt, sector_size) or None."""
+        disk = self._source_disk
+        if disk is None:
+            return None
+
+        # FDI / HDI / D88 already store geometry.
+        for attr_set in (
+            ('_cyls',),
+            # HDIImage stores _spt and _heads but not _cyls;
+            # we can derive cyls from total_sectors.
+        ):
+            pass
+
+        spt = getattr(disk, '_spt', 0)
+        heads = getattr(disk, '_heads', 0)
+        ss = disk.sector_size
+
+        if spt and heads:
+            cyls = disk.total_sectors // (spt * heads) or 1
+            return (cyls, heads, spt, ss)
+
+        # FDIImage: geometry is parsed from header.
+        # Try to extract from the label "FDI (77C/2H/8S)" etc.
+        label = getattr(disk, '_label', '') or ''
+        import re
+        m = re.search(r'(\d+)C/(\d+)H/(\d+)S', label)
+        if m:
+            return (int(m.group(1)), int(m.group(2)),
+                    int(m.group(3)), ss)
+
+        # Raw images: try known floppy sizes.
+        raw_bytes = disk.total_sectors * ss
+        if raw_bytes in _RAW_FLOPPY_GEOMETRIES:
+            return _RAW_FLOPPY_GEOMETRIES[raw_bytes]
+
+        # Hard disk guess: 512-byte sectors, 17 spt, 8 heads.
+        if ss == 512 and disk.total_sectors > 2880:
+            spt_g, heads_g = 17, 8
+            cyls_g = disk.total_sectors // (spt_g * heads_g)
+            if cyls_g > 0:
+                return (cyls_g, heads_g, spt_g, ss)
+
+        return None
+
+    def _target_ext(self):
+        val = self.fmt_combo.GetValue()
+        if val.startswith("HDM"):
+            return ".hdm"
+        return f".{val.lower()}"
+
+    # ── Events ───────────────────────────────────────────────────
+
+    def _on_browse_source(self, event):
+        dlg = wx.FileDialog(
+            self, "Select Source Image",
+            wildcard=IMAGE_WILDCARD,
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST)
+        dlg.CentreOnParent()
+        if dlg.ShowModal() == wx.ID_OK:
+            self._load_source(dlg.GetPath())
+        dlg.Destroy()
+
+    def _on_browse_dest(self, event):
+        ext = self._target_ext()
+        name = "converted" + ext
+        if self._source_path:
+            stem = Path(self._source_path).stem
+            name = stem + ext
+        dlg = wx.FileDialog(
+            self, "Save Converted Image As",
+            defaultFile=name,
+            wildcard=f"Image (*{ext})|*{ext}|All Files (*.*)|*.*",
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
+        dlg.CentreOnParent()
+        if dlg.ShowModal() == wx.ID_OK:
+            self._save_path = dlg.GetPath()
+            self.save_ctrl.SetValue(self._save_path)
+        dlg.Destroy()
+
+    def _on_ok(self, event):
+        if not self._source_disk:
+            wx.MessageBox("Please select a source image.",
+                          "No Source", wx.OK | wx.ICON_WARNING)
+            return
+        if not self._save_path:
+            wx.MessageBox("Please choose where to save.",
+                          "No Destination", wx.OK | wx.ICON_WARNING)
+            return
+
+        geom = self._detect_geometry()
+        if geom is None:
+            wx.MessageBox(
+                "Cannot determine disk geometry.\n\n"
+                "The source image has no geometry information and\n"
+                "doesn\u2019t match any known floppy size.",
+                "Unknown Geometry", wx.OK | wx.ICON_ERROR)
+            return
+
+        try:
+            self._do_convert(geom)
+            self.EndModal(wx.ID_OK)
+        except Exception as exc:
+            wx.MessageBox(
+                f"Conversion failed:\n\n{exc}",
+                "Error", wx.OK | wx.ICON_ERROR)
+
+    def _do_convert(self, geom):
+        """Read all sectors from source and write to the target format."""
+        disk = self._source_disk
+        cyls, heads, spt, ss = geom
+        total = cyls * heads * spt
+
+        # Read the flat raw data from the source image.
+        raw = bytearray()
+        for lba in range(total):
+            raw.extend(disk.read_sector(lba))
+
+        # Pad or truncate to exact geometry size.
+        expected = total * ss
+        if len(raw) < expected:
+            raw.extend(b'\x00' * (expected - len(raw)))
+        elif len(raw) > expected:
+            raw = raw[:expected]
+
+        fmt = self.fmt_combo.GetValue()
+        path = self._save_path
+
+        if fmt == "FDI":
+            _write_fdi(path, raw, cyls, heads, spt, ss)
+        elif fmt == "HDI":
+            _write_hdi(path, raw, cyls, heads, spt, ss)
+        elif fmt == "D88":
+            _write_d88(path, raw, cyls, heads, spt, ss)
+        else:
+            # HDM / RAW — flat dump, no header.
+            with open(path, 'wb') as f:
+                f.write(raw)
+
+    # ── Accessors ────────────────────────────────────────────────
+
+    def get_save_path(self):
+        return self._save_path
 
 
 class BusyDialog(wx.Dialog):
@@ -438,6 +775,7 @@ class PC98MountFrame(wx.Frame):
         super().__init__(None, title="PC-98 Disk Image Mounter",
                          size=(1060, 660))
         self.SetMinSize((800, 500))
+        self._set_icon()
 
         self.images = []
         self._tree_paths = {}
@@ -456,6 +794,27 @@ class PC98MountFrame(wx.Frame):
         self._busy_dlg = None
 
         self._update_mount_targets()
+
+    # ── Icon ────────────────────────────────────────────────────────
+
+    def _set_icon(self):
+        """Load the application icon from cd-drive.png next to this script."""
+        try:
+            icon_path = Path(__file__).parent / "cd-drive.png"
+            if icon_path.is_file():
+                img = wx.Image(str(icon_path), wx.BITMAP_TYPE_PNG)
+                # Create a multi-resolution icon bundle for crisp
+                # display on both standard and high-DPI screens.
+                bundle = wx.IconBundle()
+                for size in (16, 32, 48, 64, 128):
+                    scaled = img.Scale(size, size, wx.IMAGE_QUALITY_HIGH)
+                    bmp = wx.Bitmap(scaled)
+                    icon = wx.Icon()
+                    icon.CopyFromBitmap(bmp)
+                    bundle.AddIcon(icon)
+                self.SetIcons(bundle)
+        except Exception as exc:
+            log.debug(f"Could not load icon: {exc}")
 
     # ── UI Construction ──────────────────────────────────────────────
 
@@ -495,7 +854,14 @@ class PC98MountFrame(wx.Frame):
 
         btn_unmount = wx.Button(panel, label="Unmount")
         btn_unmount.Bind(wx.EVT_BUTTON, self._on_unmount)
-        mount_bar.Add(btn_unmount, 0)
+        mount_bar.Add(btn_unmount, 0, wx.RIGHT, 8)
+
+        btn_convert = wx.Button(panel, label="Convert")
+        btn_convert.SetToolTip(
+            "Convert a disk image between formats\n"
+            "(e.g. raw .img \u2192 .fdi/.hdi for Anex86)")
+        btn_convert.Bind(wx.EVT_BUTTON, self._on_convert)
+        mount_bar.Add(btn_convert, 0)
 
         main_sizer.Add(mount_bar, 0,
                         wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
@@ -861,25 +1227,43 @@ class PC98MountFrame(wx.Frame):
             self._on_image_select(None)
 
             total_kb = disk.total_sectors * disk.sector_size // 1024
-            fat_str = f"FAT{fs.fat_type}" if fs else "No FAT"
+            fs_str = fs.fs_type_label if fs else "No FAT"
             file_count = (
                 sum(1 for _, e in fs.walk() if not e.is_directory)
                 if fs else 0
             )
             status = (
-                f"Loaded {Path(path).name}: {fat_str}, "
+                f"Loaded {Path(path).name}: {fs_str}, "
                 f"{disk.total_sectors} sectors \u00d7 "
                 f"{disk.sector_size}B = {total_kb} KB"
             )
             if fs:
-                if file_count > 0:
+                if not fs.can_write_back:
+                    status += (
+                        f" \u2014 \u26a0 {fs.write_back_status}"
+                        f" (read-only, write-back disabled)")
+                elif file_count > 0:
                     status += f", {file_count} files found"
                 else:
-                    status += (" \u2014 WARNING: FAT parsed but "
+                    status += (f" \u2014 WARNING: {fs_str} parsed but "
                                "0 files found!")
             else:
                 status += " (raw access only)"
             self._set_status(status)
+
+            # Show a dialog warning for unreliable filesystem detection
+            # so users don't accidentally corrupt non-FAT images
+            # (e.g. PC-8801 D88 with N88-BASIC filesystem).
+            if fs and not fs.can_write_back:
+                wx.MessageBox(
+                    f"No valid filesystem was reliably detected.\n\n"
+                    f"{fs.write_back_status}.\n\n"
+                    f"This may be a non-FAT disk\n"
+                    f"(e.g. PC-8801 N88-BASIC format).\n\n"
+                    f"You can browse files (if any were found), but\n"
+                    f"write-back is disabled to prevent corruption.",
+                    "Filesystem Not Detected",
+                    wx.OK | wx.ICON_WARNING)
         except Exception as e:
             wx.MessageBox(f"Could not load:\n{path}\n\n{e}",
                           "Error", wx.OK | wx.ICON_ERROR)
@@ -928,7 +1312,7 @@ class PC98MountFrame(wx.Frame):
 
         total_kb = info.disk.total_sectors * info.disk.sector_size // 1024
         self.info_label.SetLabel(
-            f"{info.label} \u2014 FAT{info.fs.fat_type}, "
+            f"{info.label} \u2014 {info.fs.fs_type_label}, "
             f"{info.disk.sector_size}B sectors, {total_kb} KB{mounted}")
 
         root = self.file_tree.GetRootItem()
@@ -993,7 +1377,7 @@ class PC98MountFrame(wx.Frame):
             lines += [
                 "\u2500\u2500 FAT Filesystem \u2500" * 3,
                 f"Volume Label:    {vol_line}",
-                f"FAT Type:        FAT{fs.fat_type}",
+                f"Filesystem:      {fs.fs_type_label}",
                 f"Bytes/Sector:    {fs.bytes_per_sector}",
                 f"Sects/Cluster:   {fs.sectors_per_cluster}",
                 f"Reserved Sects:  {fs.reserved_sectors}",
@@ -1080,6 +1464,19 @@ class PC98MountFrame(wx.Frame):
                 "Use 'flat' or 'sectors' mode for raw access.",
                 "No FAT", wx.OK | wx.ICON_WARNING)
             return
+
+        if (mode == "fat" and info.fs
+                and not info.fs.can_write_back):
+            answer = wx.MessageBox(
+                "No valid filesystem was reliably detected.\n\n"
+                f"{info.fs.write_back_status}.\n\n"
+                f"You can mount it read-only, but write-back will be\n"
+                f"disabled to prevent corruption.\n\n"
+                f"Mount anyway?",
+                "Filesystem Not Detected",
+                wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING)
+            if answer != wx.YES:
+                return
 
         self._set_status(
             f"Mounting {Path(info.path).name} at {target} ({mode})\u2026")
@@ -1206,6 +1603,34 @@ class PC98MountFrame(wx.Frame):
         self._update_mount_targets()
         self._set_status(f"Unmounted {mid}")
 
+    # ── Convert ─────────────────────────────────────────────────────
+
+    def _on_convert(self, event):
+        """Open the Convert dialog, optionally pre-loading the currently
+        selected image as the source."""
+        info = self._selected_image()
+        source_path = info.path if info else None
+        source_disk = info.disk if info else None
+
+        dlg = ConvertDialog(self,
+                            source_path=source_path,
+                            source_disk=source_disk)
+        dlg.CentreOnParent()
+        result = dlg.ShowModal()
+        save_path = dlg.get_save_path()
+        dlg.Destroy()
+
+        if result == wx.ID_OK and save_path:
+            self._set_status(f"Converted \u2192 {save_path}")
+            # Offer to open the converted image.
+            answer = wx.MessageBox(
+                f"Image converted successfully:\n{save_path}\n\n"
+                f"Open the converted image now?",
+                "Conversion Complete",
+                wx.YES_NO | wx.ICON_INFORMATION)
+            if answer == wx.YES:
+                self._load_image(save_path)
+
     # ── Update (write-back) ──────────────────────────────────────────
 
     def _on_update(self, event):
@@ -1226,6 +1651,20 @@ class PC98MountFrame(wx.Frame):
                 "Mount it first, make your changes in the file "
                 "manager, then click Update.",
                 "Not Mounted", wx.OK | wx.ICON_INFORMATION)
+            return
+
+        # Block write-back if filesystem parameters are unreliable.
+        if (info.mount_mode == 'fat' and info.fs
+                and not info.fs.can_write_back):
+            wx.MessageBox(
+                "Write-back is disabled for this image.\n\n"
+                f"{info.fs.write_back_status}.\n\n"
+                f"Writing back with unreliable parameters would\n"
+                f"corrupt the image.\n\n"
+                f"You can still use 'flat' or 'sectors' mode for\n"
+                f"raw access.",
+                "Write-Back Disabled",
+                wx.OK | wx.ICON_ERROR)
             return
 
         # --- Confirmation dialog with three choices ---
