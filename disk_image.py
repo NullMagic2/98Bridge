@@ -66,23 +66,49 @@ class DiskImage:
         If *path* is given the image is written there (the original is
         untouched).  Otherwise the original file is overwritten via an
         atomic write-to-temp-then-rename pattern.
+
+        The temp file is created next to the target when possible; if
+        that fails (e.g. the directory is on a read-only volume or a
+        network share that disallows new files), a system temp directory
+        is used instead.
         """
+        import tempfile as _tempfile
+
         save_path = path or self.path
         if save_path == self.path:
-            # Atomic overwrite: write next to the original, then rename.
-            tmp = save_path + '.tmp'
+            # Atomic overwrite: write to a temp file, then rename.
+            # Try the same directory first (cheapest, stays on same volume).
+            same_dir = os.path.dirname(os.path.abspath(save_path))
+            tmp = None
             try:
-                with open(tmp, 'wb') as f:
-                    f.write(self._data)
-                # On Windows, os.replace is atomic if on the same volume.
+                fd = _tempfile.NamedTemporaryFile(
+                    dir=same_dir, suffix='.tmp', delete=False)
+                tmp = fd.name
+                fd.write(self._data)
+                fd.close()
                 shutil.move(tmp, save_path)
-            except Exception:
-                # Clean up partial write.
+            except OSError:
+                # Same-directory write failed — fall back to the
+                # system temp directory then copy across.
+                if tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
                 try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+                    fd = _tempfile.NamedTemporaryFile(
+                        suffix='.tmp', delete=False)
+                    tmp = fd.name
+                    fd.write(self._data)
+                    fd.close()
+                    shutil.move(tmp, save_path)
+                except Exception:
+                    if tmp:
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+                    raise
         else:
             with open(save_path, 'wb') as f:
                 f.write(self._data)
