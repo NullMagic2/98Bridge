@@ -3,6 +3,9 @@
 Mount, browse, and extract files from NEC PC-98 floppy and hard disk images
 on modern Windows and Linux systems.
 
+<img width="2094" height="1290" alt="image" src="https://github.com/user-attachments/assets/06d849d7-ff60-488f-b7b5-682c02b03d49" />
+
+
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-brightgreen.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20WSL-lightgrey.svg)
